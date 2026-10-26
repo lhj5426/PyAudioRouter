@@ -124,6 +124,14 @@ class Store:
         self.save()
         return on
 
+    def get_device_name(self, process_name: str, flow: int = 0, exe_path: str = "") -> str:
+        """规则里记住的设备名（设备 ID 失效时用来按名字找回）。"""
+        with self._lock:
+            r = self._rules.get(self.key(process_name, exe_path))
+            if not r or int(r.get("flow", 0)) != int(flow):
+                return ""
+            return r.get("device_name") or ""
+
     def favorites(self) -> set[str]:
         with self._lock:
             return set(self._favorites)
@@ -145,14 +153,16 @@ class Store:
                 return ""
             return r.get("device") or ""
 
-    def set(self, process_name: str, device_id: str, flow: int = 0, exe_path: str = ""):
+    def set(self, process_name: str, device_id: str, flow: int = 0,
+            exe_path: str = "", device_name: str = ""):
         k = self.key(process_name, exe_path)
         if not k:
             return
         with self._lock:
             if device_id:
                 self._rules[k] = {"device": device_id, "flow": int(flow),
-                                  "name": process_name, "path": exe_path}
+                                  "name": process_name, "path": exe_path,
+                                  "device_name": device_name}
             else:
                 self._rules.pop(k, None)
         self.save()

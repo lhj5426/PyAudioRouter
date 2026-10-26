@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 import comtypes
-from comtypes import CLSCTX_ALL, COMMETHOD, GUID, HRESULT, IUnknown, CoCreateInstance
+from comtypes import CLSCTX_ALL, COMMETHOD, GUID, HRESULT, COMObject, IUnknown, CoCreateInstance
 
 # --------------------------------------------------------------------------- #
 # 常量
@@ -128,6 +128,26 @@ class IMMDeviceCollection(IUnknown):
     ]
 
 
+class IMMNotificationClient(IUnknown):
+    """设备/默认设备变化通知回调。"""
+
+    _iid_ = GUID("{7991EEC9-7E89-4D85-8390-6C703CEC60C0}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "OnDeviceStateChanged",
+                  (['in'], c_wchar_p, 'pwstrDeviceId'),
+                  (['in'], c_uint32, 'dwNewState')),
+        COMMETHOD([], HRESULT, "OnDeviceAdded", (['in'], c_wchar_p, 'pwstrDeviceId')),
+        COMMETHOD([], HRESULT, "OnDeviceRemoved", (['in'], c_wchar_p, 'pwstrDeviceId')),
+        COMMETHOD([], HRESULT, "OnDefaultDeviceChanged",
+                  (['in'], c_int, 'flow'),
+                  (['in'], c_int, 'role'),
+                  (['in'], c_wchar_p, 'pwstrDefaultDeviceId')),
+        COMMETHOD([], HRESULT, "OnPropertyValueChanged",
+                  (['in'], c_wchar_p, 'pwstrDeviceId'),
+                  (['in'], PROPERTYKEY, 'key')),
+    ]
+
+
 class IMMDeviceEnumerator(IUnknown):
     _iid_ = GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
     _methods_ = [
@@ -143,9 +163,9 @@ class IMMDeviceEnumerator(IUnknown):
                   (['in'], c_wchar_p, 'pwstrId'),
                   (['out'], POINTER(POINTER(IMMDevice)), 'ppDevice')),
         COMMETHOD([], HRESULT, "RegisterEndpointNotificationCallback",
-                  (['in'], c_void_p, 'pClient')),
+                  (['in'], POINTER(IMMNotificationClient), 'pClient')),
         COMMETHOD([], HRESULT, "UnregisterEndpointNotificationCallback",
-                  (['in'], c_void_p, 'pClient')),
+                  (['in'], POINTER(IMMNotificationClient), 'pClient')),
     ]
 
 
@@ -346,7 +366,11 @@ class IPolicyConfig(IUnknown):
 # --------------------------------------------------------------------------- #
 # WinRT: IAudioPolicyConfigFactory（按进程持久化端点）
 # --------------------------------------------------------------------------- #
-IAudioPolicyConfigFactory_IID = GUID("{2a59116d-6c4f-45e0-a74f-707e3fef9258}")
+# 两个版本的接口 IID：新版在 Win10 21H2+ / Win11 才有，老版在更早的 Win10
+_POLICY_IIDS = (
+    GUID("{ab3d4648-e242-459f-b02f-541c70306324}"),  # Win10 21H2+ / Win11
+    GUID("{2a59116d-6c4f-45e0-a74f-707e3fef9258}"),  # older Windows 10
+)
 
 _combase = ctypes.WinDLL("combase")
 _combase.RoGetActivationFactory.argtypes = [c_void_p, POINTER(GUID), POINTER(c_void_p)]
@@ -406,14 +430,16 @@ class PolicyConfigFactory:
         last = None
         for name in _POLICY_CONFIG_CLASSES:
             with _HString(name) as hs:
-                ptr = c_void_p()
-                hr = _combase.RoGetActivationFactory(
-                    hs.handle, byref(IAudioPolicyConfigFactory_IID), byref(ptr))
-            if hr >= 0 and ptr:
-                self._ptr = ptr
-                self._class_name = name
+                for iid in _POLICY_IIDS:
+                    ptr = c_void_p()
+                    hr = _combase.RoGetActivationFactory(hs.handle, byref(iid), byref(ptr))
+                    if hr >= 0 and ptr:
+                        self._ptr = ptr
+                        self._class_name = name
+                        break
+                    last = hr
+            if self._ptr:
                 break
-            last = hr
         if not self._ptr:
             raise OSError(
                 "无法激活 AudioPolicyConfig（需要 Windows 10 1803 及以上）。"
@@ -539,12 +565,44 @@ class Session:
 # --------------------------------------------------------------------------- #
 # 主入口
 # --------------------------------------------------------------------------- #
+class _DeviceNotifyClient(COMObject):
+    """把 IMMNotificationClient 的回调转成一个无参回调。"""
+
+    _com_interfaces_ = [IMMNotificationClient]
+
+    def __init__(self, on_change):
+        self._on_change = on_change
+
+    def _fire(self, *args):
+        try:
+            self._on_change(*args)
+        except Exception:
+            pass
+        return 0
+
+    def OnDeviceStateChanged(self, device_id, new_state):
+        return self._fire()
+
+    def OnDeviceAdded(self, device_id):
+        return self._fire()
+
+    def OnDeviceRemoved(self, device_id):
+        return self._fire()
+
+    def OnDefaultDeviceChanged(self, flow, role, device_id):
+        return self._fire(flow, role, device_id)
+
+    def OnPropertyValueChanged(self, device_id, key):
+        return 0
+
+
 class AudioCore:
     def __init__(self):
         self._enum: IMMDeviceEnumerator | None = None
         self._policy: PolicyConfigFactory | None = None
         self._policy_error: str | None = None
         self._dev_ep: dict[str, tuple] = {}
+        self._notify_client = None
 
     # -- 生命周期 -----------------------------------------------------------
     def initialize(self):
@@ -583,15 +641,8 @@ class AudioCore:
     def _devices_of(self, flow: int, state_mask: int = DEVICE_STATE_ACTIVE) -> list[Device]:
         coll = self._enum.EnumAudioEndpoints(flow, state_mask)
         default_id = ""
-        default_comms = ""
-        try:
-            default_id = self._enum.GetDefaultAudioEndpoint(flow, eConsole).GetId()
-        except Exception:
-            pass
-        try:
-            default_comms = self._enum.GetDefaultAudioEndpoint(flow, eCommunications).GetId()
-        except Exception:
-            pass
+        default_id = self.get_default_id(flow, eConsole)
+        default_comms = self.get_default_id(flow, eCommunications)
 
         out: list[Device] = []
         for i in range(coll.GetCount()):
@@ -692,10 +743,30 @@ class AudioCore:
         except Exception:
             return 0.0
 
-    def get_default_id(self, flow: int = eRender, role: int = eConsole) -> str:
-        """只取默认设备 ID，开销极小，用于高频轮询检测默认设备有没有被改。"""
+    def watch_devices(self, on_change) -> bool:
+        """注册系统设备变化通知（默认设备切换、插拔）。
+
+        回调在注册线程上触发。返回 False 表示当前系统不支持。
+        """
         try:
-            return self._enum.GetDefaultAudioEndpoint(flow, role).GetId() or ""
+            client = _DeviceNotifyClient(on_change)
+            self._enum.RegisterEndpointNotificationCallback(client)
+            self._notify_client = client          # 必须持有引用，否则被 GC 后回调崩溃
+            return True
+        except Exception:
+            self._notify_client = None
+            return False
+
+    def get_default_id(self, flow: int = eRender, role: int = eConsole) -> str:
+        """读当前系统默认设备。
+
+        每次新建 IMMDeviceEnumerator：长期持有的实例在系统切过默认设备之后
+        可能一直返回旧值（audiosrv 内部状态刷新），导致界面认为默认没变。
+        """
+        try:
+            enum = CoCreateInstance(CLSID_MMDeviceEnumerator,
+                                    interface=IMMDeviceEnumerator, clsctx=CLSCTX_ALL)
+            return enum.GetDefaultAudioEndpoint(flow, role).GetId() or ""
         except Exception:
             return ""
 

@@ -24,9 +24,11 @@ from ui_widgets import DeviceCard, EmptyHint, SessionRow, TitleBar
 
 
 APP_TITLE = "多声卡窗口管理"
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 class MainWindow(QWidget):
+    _default_ready = Signal(str)
     def __init__(self):
         super().__init__()
         self.core = ac.AudioCore()
@@ -39,6 +41,10 @@ class MainWindow(QWidget):
         self._dev_sig: tuple | None = None
         self.show_fav_only = False
         self.selected_device: str | None = None
+        self._default_override = ""
+        self._override_until = 0.0
+        self._sub_busy = False
+        self._route_ts: dict[int, float] = {}
         self._refresh_tick = 0
         self._applied: set[str] = set()
 
@@ -57,7 +63,7 @@ class MainWindow(QWidget):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self.refresh(full=False))
-        self.timer.start(1000)
+        self.timer.start(1500)
 
         # 轻量轮询：只读默认设备 ID（单次 COM 调用），变了立刻重绘设备卡片。
         # 这样在录制软件 / 系统托盘里切默认设备，这边 0.5 秒内跟上。
@@ -65,6 +71,14 @@ class MainWindow(QWidget):
         self.dev_timer = QTimer(self)
         self.dev_timer.timeout.connect(self._check_default_device)
         self.dev_timer.start(500)
+
+        # 系统设备变化通知：默认设备切换、设备插拔时立即刷新（比 500ms 轮询更及时）
+        self.core.watch_devices(self._on_device_event)
+
+        # 启动后用独立子进程校正一次默认设备（本进程读到的可能是缓存值）。
+        # 只做一次：切换默认设备走系统通知，不再起子进程，避免每次切换都卡一下。
+        self._default_ready.connect(self._apply_default_override)
+        QTimer.singleShot(1500, self._refresh_default_from_subprocess)
 
         # 电平条刷新（80ms，只读 GetPeakValue，开销很小）
         self.meter_timer = QTimer(self)
@@ -116,7 +130,7 @@ class MainWindow(QWidget):
         self.btn_refresh = QPushButton("↻  刷新")
         self.btn_refresh.setObjectName("GhostBtn")
         self.btn_refresh.setCursor(Qt.PointingHandCursor)
-        self.btn_refresh.clicked.connect(lambda: self.refresh(full=True))
+        self.btn_refresh.clicked.connect(self._force_refresh)
         top.addWidget(self.btn_refresh)
         lay.addLayout(top)
 
@@ -301,9 +315,19 @@ class MainWindow(QWidget):
         except Exception:
             self.devices = []
 
+        # 用「子进程读到的真值 / 系统通知带来的 id」覆盖缓存值。
+        # 不设过期：本进程的 GetDefaultAudioEndpoint 会一直返回旧值，
+        # 只有系统真的切换（收到 OnDefaultDeviceChanged）时才更新它。
+        if self._default_override:
+            if time.monotonic() < self._override_until:
+                for d in self.devices:
+                    d.is_default = (d.id == self._default_override)
+            else:
+                self._default_override = ""
+
         # 设备有变化（默认设备切换、插拔）就重建卡片，外部改默认也能反映出来
         sig = tuple((d.id, d.is_default) for d in self.devices)
-        if full or not self.device_layout.count() or sig != self._dev_sig:
+        if not self.device_layout.count() or sig != self._dev_sig:
             self._dev_sig = sig
             self._rebuild_devices()
         self._last_default_id = next((d.id for d in self.devices if d.is_default), "")
@@ -326,12 +350,88 @@ class MainWindow(QWidget):
         self._refresh_tick += 1
         self._update_status()
 
+    def _read_default_fresh(self) -> str:
+        """用一个独立子进程读系统默认设备。
+
+        audiosrv 会按进程缓存默认设备，本进程内怎么读都可能拿到旧值；
+        新起的进程读到的才是当前真实值。
+
+        用 pythonw.exe（无控制台，不会闪黑框）启动，结果写临时文件回传——
+        pythonw 没有 stdout，抓不到 print 输出。
+        """
+        try:
+            import subprocess
+            import tempfile
+            base = os.path.dirname(sys.executable)
+            pyw = os.path.join(base, "pythonw.exe")
+            py = pyw if os.path.isfile(pyw) else os.path.join(base, "python.exe")
+            out = os.path.join(tempfile.gettempdir(), f"pyar_def_{os.getpid()}.txt")
+            code = ("import sys, comtypes;"
+                    f"sys.path.insert(0, {HERE!r});"
+                    "import audio_core as ac;"
+                    "comtypes.CoInitialize();"
+                    "c = ac.AudioCore(); c.initialize();"
+                    f"open({out!r}, 'w', encoding='utf-8').write(c.get_default_id(0, 0))")
+            subprocess.run([py, "-c", code], timeout=25,
+                           creationflags=0x08000000,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with open(out, encoding="utf-8") as f:
+                did = f.read().strip()
+            try:
+                os.remove(out)
+            except Exception:
+                pass
+            return did
+        except Exception:
+            return ""
+
+    def _refresh_default_from_subprocess(self):
+        # 子进程启动要 1~2 秒，放后台线程；同时只允许一个在跑
+        if getattr(self, "_sub_busy", False):
+            return
+        self._sub_busy = True
+
+        def work():
+            try:
+                did = self._read_default_fresh()
+                if did:
+                    self._default_ready.emit(did)      # 跨线程安全
+            finally:
+                self._sub_busy = False
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_default_override(self, device_id: str):
+        if not device_id:
+            return
+        self._default_override = device_id
+        self._override_until = time.monotonic() + 60.0
+        self.refresh(full=True)
+
+    def _on_device_event(self, flow: int = -1, role: int = -1, device_id: str = ""):
+        """COM 通知回调：只当成「该重新读一次」的信号。
+
+        回调里带的 device_id 不能直接用——audiosrv 给的可能还是缓存旧值，
+        一旦拿它当覆盖值，界面就会锁死在旧设备上（之前就是这个 bug）。
+        所以统一改成用子进程重新读真值。
+        """
+        if flow == ac.eRender and role in (ac.eConsole, ac.eMultimedia) and device_id:
+            self._default_override = device_id
+            self._override_until = time.monotonic() + 60.0
+        QTimer.singleShot(50, lambda: self.refresh(full=True))
+
     def _check_default_device(self):
         """0.5 秒一次的轻量检测：默认设备被别人改了就把界面跟上。"""
         cur = self.core.get_default_id(self.flow)
         if not cur or cur == self._last_default_id:
             return
         self._last_default_id = cur
+        self.refresh(full=True)
+
+    def _force_refresh(self):
+        """手动刷新：强制重建设备卡片（平时只在设备真变了才重建）。"""
+        self._dev_sig = None
         self.refresh(full=True)
 
     def _on_filter_changed(self, idx: int):
@@ -383,11 +483,22 @@ class MainWindow(QWidget):
             row.set_level(level)
 
     def _effective_device(self, s: ac.Session) -> str:
-        """会话实际所在设备。若正好在系统默认设备上，返回空串表示「跟随系统」。"""
-        dev = s.device_id or ""
-        if not dev or dev == self._last_default_id:
-            return ""
-        return dev
+        """下拉显示的值：以你在本程序里的设置为准。
+
+        设过就一直显示你设的那块，不会被系统里的当前值弹回去
+        （CheVolume 也是这个行为：界面上切换自由，不会被别的软件改回来）。
+        从没设过的应用才显示它当前实际在哪块。
+        """
+        saved = self.store.get(s.process_name, self.flow, s.exe_path)
+        if saved:
+            if any(d.id == saved for d in self.devices):
+                return saved
+            want = self.store.get_device_name(s.process_name, self.flow, s.exe_path)
+            if want:
+                for d in self.devices:
+                    if d.short_name == want or d.name == want:
+                        return d.id
+        return s.device_id or ""
 
     def _rebuild_devices(self):
         self._clear_layout(self.device_layout)
@@ -442,21 +553,19 @@ class MainWindow(QWidget):
                 if row is None:
                     continue
             else:
-                if row.session.pid == s.pid:
-                    # 同一进程：复用旧会话对象（含 COM 引用），只刷新数值，
-                    # 避免每次刷新都重建一批 COM 对象导致会话引用累积。
-                    s._vol = None
-                    s._ctl = None
-                    row.update_volume(s.volume, s.muted)
-                    row.session.volume = s.volume
-                    row.session.muted = s.muted
-                    if row.session.device_id != s.device_id:
-                        row.session.device_id = s.device_id
-                        row.apply_current_device(self._effective_device(row.session))
-                else:
-                    row.session._vol = None
-                    row.session._ctl = None
-                    row.session = s
+                # 一律换成本次枚举出来的新会话对象。
+                # 切声卡或应用重开音频流时，audiosrv 会重建会话，旧对象上的
+                # 音量(ISimpleAudioVolume)、静音、电平(IAudioMeterInformation)
+                # 接口全部失效——复用电平会一直读到 0，音量滑块也会失灵。
+                old = row.session
+                row.session = s
+                old._vol = None
+                old._ctl = None
+                old._meter = None
+                row.update_volume(s.volume, s.muted)
+                want = self._effective_device(s)
+                if want != row.current_device_id():
+                    row.apply_current_device(want)
                 if s.exe_path and row.icon_label.pixmap().isNull():
                     from ui_widgets import file_icon
                     ic = file_icon(s.exe_path)
@@ -470,6 +579,7 @@ class MainWindow(QWidget):
                 try:
                     row.session._vol = None
                     row.session._ctl = None
+                    row.session._meter = None
                 except Exception:
                     pass
                 row.deleteLater()
@@ -511,13 +621,9 @@ class MainWindow(QWidget):
         self.session_layout.insertWidget(self.session_layout.count() - 1, row)
         self.rows[key] = row
 
-        # 下拉显示「当前实际在用的设备」：会话挂在哪块声卡上就是哪块
-        effective = self._effective_device(s)
+        # 下拉：有记住的选择就显示它，否则显示会话实际所在设备
         saved = self.store.get(s.process_name, self.flow, s.exe_path)
-        if effective:
-            row.apply_current_device(effective)
-        elif saved:
-            row.apply_current_device(saved)
+        row.apply_current_device(self._effective_device(s))
 
         # 自动套用记忆规则
         if (self.store.settings.get("auto_apply", True) and saved
@@ -573,7 +679,11 @@ class MainWindow(QWidget):
             self._update_status()
             return
 
-        self.store.set(session.process_name, device_id, self.flow, session.exe_path)
+        dev_name = next((d.short_name for d in self.devices if d.id == device_id), "")
+        self.store.set(session.process_name, device_id, self.flow,
+                       session.exe_path, dev_name)
+        for row in targets:
+            self._route_ts[row.session.pid] = time.monotonic()
         name = device_id and next((d.short_name for d in self.devices if d.id == device_id), "")
         if device_id:
             self._flash_status(f"{session.process_name} → {name}（已记住）")

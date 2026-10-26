@@ -130,11 +130,21 @@ def main() -> int:
         import comtypes  # noqa: F401
     except ImportError:
         py = _find_python()
-        if py and os.path.normcase(py) != os.path.normcase(sys.executable):
-            _save_runtime(py)
+        exe = _pythonw(py) if py else ""
+        # 关键：relaunch 用的是 pythonw.exe，而探测到的是 python.exe。
+        # 原来只比较 python.exe，导致新进程里 sys.executable=pythonw.exe 又判定为
+        # "不一样"→ 再 relaunch → 无限重启（表现就是反复闪一个空窗口）。
+        same = bool(py) and (
+            os.path.normcase(py) == os.path.normcase(sys.executable)
+            or (exe and os.path.normcase(exe) == os.path.normcase(sys.executable))
+        )
+        if py and not same and not os.environ.get("PYAR_RELAUNCHED"):
+            _save_runtime(exe)
+            env = dict(os.environ)
+            env["PYAR_RELAUNCHED"] = "1"
             try:
-                subprocess.Popen([_pythonw(py), os.path.abspath(__file__)],
-                                 creationflags=NO_WINDOW)
+                subprocess.Popen([exe, os.path.abspath(__file__)],
+                                 env=env, creationflags=NO_WINDOW)
                 return 0
             except Exception as exc:
                 _error(f"启动失败：{exc}")
