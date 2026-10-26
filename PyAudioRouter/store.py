@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 from pathlib import Path
 
@@ -11,16 +12,20 @@ APP_NAME = "PyAudioRouter"
 
 
 def data_dir() -> Path:
-    """配置目录：优先 %APPDATA%，不可写则退到程序目录下的 data\\。"""
+    """配置目录：只写程序自己的目录（run.py 旁边那个 data\\）。
+
+    %APPDATA% 只作兜底：程序目录不可写（例如装在 Program Files）时才用它。
+    """
     override = os.environ.get("PYAUDIOROUTER_DATA")
+    base = Path(__file__).resolve().parent
     candidates: list[Path] = []
     if override:
         candidates.append(Path(override))
+    candidates.append(base)
     for env in ("APPDATA", "LOCALAPPDATA"):
         v = os.environ.get(env)
         if v:
             candidates.append(Path(v) / APP_NAME)
-    candidates.append(Path(__file__).resolve().parent / "data")
     for d in candidates:
         try:
             d.mkdir(parents=True, exist_ok=True)
@@ -30,7 +35,26 @@ def data_dir() -> Path:
             return d
         except Exception:
             continue
-    return Path(__file__).resolve().parent
+    return base
+
+
+def _ban_jiu_peizhi(new_path: Path) -> None:
+    """第一次把配置放到程序根目录时，从旧位置（data\\ 或 %APPDATA%）搬过来。"""
+    if new_path.exists():
+        return
+    olds = [new_path.parent / "data" / "rules.json"]
+    for env in ("APPDATA", "LOCALAPPDATA"):
+        v = os.environ.get(env)
+        if v:
+            olds.append(Path(v) / APP_NAME / "rules.json")
+    for old in olds:
+        if old.is_file():
+            try:
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(old, new_path)
+            except Exception:
+                pass
+            return
 
 
 class Store:
@@ -42,6 +66,8 @@ class Store:
 
     def __init__(self, path: Path | None = None):
         self.path = path or (data_dir() / "rules.json")
+        if path is None:
+            _ban_jiu_peizhi(self.path)
         self._lock = threading.RLock()
         self._rules: dict[str, dict] = {}
         self._favorites: set[str] = set()

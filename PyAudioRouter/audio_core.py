@@ -674,6 +674,29 @@ if _target:
 '''
 
 
+def _lin_shi_wenjian(ming: str) -> str:
+    """临时文件放程序目录的 data\\ 下，不往系统临时目录里丢东西。"""
+    base = os.path.dirname(os.path.abspath(__file__))
+    try:
+        return os.path.join(base, ming)
+    except Exception:
+        return os.path.join(tempfile.gettempdir(), ming)
+
+
+def _qing_li_lin_shi() -> None:
+    """清掉历史遗留的临时文件（程序被强杀时可能没删掉）。"""
+    import glob
+    import time
+    base = os.path.dirname(os.path.abspath(__file__))
+    now = time.time()
+    for f in glob.glob(os.path.join(base, "pyar_def_*.txt")):
+        try:
+            if now - os.path.getmtime(f) > 300:
+                os.remove(f)
+        except Exception:
+            pass
+
+
 def _zi_jincheng_jieshiqi() -> str:
     """子进程用的解释器：优先 pythonw.exe（不会闪控制台）。"""
     try:
@@ -873,7 +896,8 @@ class AudioCore:
 
         见 _ZI_JINCHENG_DAIMA 上方的说明。失败返回空字符串。
         """
-        out = os.path.join(tempfile.gettempdir(), f"pyar_def_{os.getpid()}.txt")
+        out = _lin_shi_wenjian(f"pyar_def_{os.getpid()}.txt")
+        _qing_li_lin_shi()
         try:
             try:
                 os.remove(out)
