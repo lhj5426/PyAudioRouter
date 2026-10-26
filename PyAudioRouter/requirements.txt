@@ -1,0 +1,3 @@
+PySide6>=6.5
+comtypes>=1.2
+psutil>=5.9
