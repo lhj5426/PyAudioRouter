@@ -13,3 +13,12 @@
 
 <img width="1075" height="824" alt="image" src="https://github.com/user-attachments/assets/c1398cb8-425d-4106-b330-cf7f3f802d60" />
 
+对标CheVolume 可以 跟随Bandicam 的声卡切换
+
+
+https://github.com/user-attachments/assets/96338a4d-cef6-49cc-8183-7dc781b63ef2
+
+支持收藏应用 和声卡过滤 可当同和过滤用
+
+https://github.com/user-attachments/assets/253e3a86-27db-42fa-8e05-d11da0e69d7f
+
