@@ -181,6 +181,10 @@ QLabel#DevPct {{
     font-size: 11px;
     color: {c['sub']};
 }}
+QLabel#LevelPct {{
+    font-size: 10px;
+    color: {c['faint']};
+}}
 QLabel#Badge {{
     background: {c['accent_soft']};
     color: {c['accent']};
@@ -206,6 +210,10 @@ QFrame#SessionRow {{
 QFrame#SessionRow:hover {{
     border-color: {c['border_strong']};
 }}
+QFrame#SessionRow[sel="true"] {{
+    background: {c['accent_soft']};
+    border: 1px solid {c['accent']};
+}}
 QLabel#AppName {{
     font-size: 13px;
     font-weight: 600;
@@ -219,6 +227,19 @@ QLabel#VolValue {{
     font-size: 11px;
     color: {c['sub']};
     min-width: 34px;
+}}
+QLabel#RowNo {{
+    font-size: 11px;
+    color: {c['text']};
+}}
+QLabel#FavState {{
+    font-size: 11px;
+    color: {c['text']};
+}}
+QLabel#GroupTitle {{
+    font-size: 12px;
+    font-weight: 600;
+    color: {c['sub']};
 }}
 
 /* ---------- 下拉框 ---------- */

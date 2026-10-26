@@ -51,6 +51,7 @@ class Store:
             "minimize_to_tray": True,
             "show_system_sounds": False,
             "win": [],
+            "hidden": {},          # 已移除的应用：key -> {name, path}
         }
         self.load()
 
@@ -108,6 +109,14 @@ class Store:
         k = self.key(process_name, exe_path)
         with self._lock:
             return bool(k) and k in self._favorites
+
+    def remove_fav(self, key: str):
+        """按存储键直接取消收藏（收藏页管理用）。"""
+        with self._lock:
+            gone = str(key).lower() in self._favorites
+            self._favorites.discard(str(key).lower())
+        if gone:
+            self.save()
 
     def toggle_fav(self, process_name: str, exe_path: str = "") -> bool:
         """切换收藏，返回切换后是否已收藏。"""
@@ -170,6 +179,10 @@ class Store:
     def remove(self, process_name: str, exe_path: str = ""):
         with self._lock:
             self._rules.pop(self.key(process_name, exe_path), None)
+            # 旧版按进程名存的规则也要一起删，否则 get() 还能从那里读回来
+            legacy = self._legacy_key(process_name)
+            if legacy:
+                self._rules.pop(legacy, None)
         self.save()
 
     def clear(self, flow: int | None = None):
@@ -179,6 +192,33 @@ class Store:
             else:
                 for k in [k for k, v in self._rules.items() if int(v.get("flow", 0)) == int(flow)]:
                     self._rules.pop(k, None)
+        self.save()
+
+    # -- 已移除的应用 -------------------------------------------------------
+    def hidden_items(self) -> dict[str, dict]:
+        with self._lock:
+            return dict(self.settings.get("hidden") or {})
+
+    def is_hidden(self, process_name: str, exe_path: str = "") -> bool:
+        k = self.key(process_name, exe_path)
+        with self._lock:
+            return bool(k) and k in (self.settings.get("hidden") or {})
+
+    def hide(self, process_name: str, exe_path: str = ""):
+        k = self.key(process_name, exe_path)
+        if not k:
+            return
+        with self._lock:
+            h = dict(self.settings.get("hidden") or {})
+            h[k] = {"name": process_name or k, "path": exe_path or ""}
+            self.settings["hidden"] = h
+        self.save()
+
+    def unhide(self, key: str):
+        with self._lock:
+            h = dict(self.settings.get("hidden") or {})
+            h.pop(key, None)
+            self.settings["hidden"] = h
         self.save()
 
     def all_rules(self) -> dict[str, dict]:

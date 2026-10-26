@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
+import subprocess
+import sys
+import tempfile
 from ctypes import (
     POINTER, Structure, WINFUNCTYPE, byref, c_float, c_int, c_long, c_uint32,
     c_ulong, c_ushort, c_void_p, c_wchar_p, sizeof,
@@ -453,11 +457,18 @@ class PolicyConfigFactory:
 
     # -- 公开 ---------------------------------------------------------------
     def set_persisted(self, pid: int, flow: int, role: int, device_id: str) -> None:
-        """把 pid 在 flow/role 上的端点设为 device_id（传空串 = 清除）。"""
-        swd = swd_endpoint(device_id, flow) if device_id else ""
-        with _HString(swd) as hs:
+        """把 pid 在 flow/role 上的端点设为 device_id（传空串 = 清除）。
+
+        清除时必须传 NULL，传空字符串 Windows 不认。
+        """
+        hs = _HString(swd_endpoint(device_id, flow)) if device_id else None
+        try:
             fn = self._call(_VT_SET_PERSISTED, c_uint32, c_int, c_int, c_void_p)
-            hr = fn(self._ptr, c_uint32(pid), c_int(flow), c_int(role), hs.handle)
+            hr = fn(self._ptr, c_uint32(pid), c_int(flow), c_int(role),
+                    hs.handle if hs is not None else None)
+        finally:
+            if hs is not None:
+                hs.close()
         if hr < 0:
             raise OSError(f"SetPersistedDefaultAudioEndpoint failed: 0x{hr & 0xFFFFFFFF:08X}")
 
@@ -596,6 +607,86 @@ class _DeviceNotifyClient(COMObject):
         return 0
 
 
+# --------------------------------------------------------------------------- #
+# 系统默认设备：在独立进程里读
+# --------------------------------------------------------------------------- #
+# 为什么不在本进程读：MMDevAPI 会按进程缓存「默认端点」。程序启动之后，
+# 用户在系统里（或别的软件里）把默认设备换成别的，本进程的
+# IMMDeviceEnumerator::GetDefaultAudioEndpoint 可能一直返回旧值，
+# 界面上的「默认」徽章就钉死在旧声卡上。新起一个进程读，永远读到真实值。
+# 这段子代码只用标准库 ctypes，配合 -S 启动，约 150ms，不加载 comtypes/PySide6。
+_ZI_JINCHENG_DAIMA = r'''
+import ctypes, sys
+from ctypes import (POINTER, WINFUNCTYPE, Structure, byref, c_int, c_ubyte,
+                    c_ulong, c_ushort, c_void_p, c_wchar_p, wstring_at)
+
+
+class _GUID(Structure):
+    _fields_ = [("d1", c_ulong), ("d2", c_ushort), ("d3", c_ushort),
+                ("d4", c_ubyte * 8)]
+
+
+def _guid(text):
+    g = _GUID()
+    _ole32.CLSIDFromString(text, byref(g))
+    return g
+
+
+_ole32 = ctypes.WinDLL("ole32")
+_ole32.CLSIDFromString.argtypes = [c_wchar_p, POINTER(_GUID)]
+_ole32.CLSIDFromString.restype = ctypes.c_long
+_ole32.CoCreateInstance.argtypes = [POINTER(_GUID), c_void_p, c_ulong,
+                                    POINTER(_GUID), POINTER(c_void_p)]
+_ole32.CoCreateInstance.restype = ctypes.c_long
+_ole32.CoTaskMemFree.argtypes = [c_void_p]
+_ole32.CoInitializeEx(None, 2)
+
+_flow, _role, _out = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+_target = sys.argv[4] if len(sys.argv) > 4 else ""
+_penum = c_void_p()
+if _ole32.CoCreateInstance(
+        byref(_guid("{BCDE0395-E52F-467C-8E3D-C4579291692E}")), None, 23,
+        byref(_guid("{A95664D2-9614-4F35-A746-DE8DB63617E6}")),
+        byref(_penum)) >= 0:
+    _vt = ctypes.cast(_penum, POINTER(POINTER(c_void_p)))[0]
+    _get_default = WINFUNCTYPE(ctypes.c_long, c_void_p, c_int, c_int,
+                               POINTER(c_void_p))(_vt[4])
+    _pdev = c_void_p()
+    if _get_default(_penum, _flow, _role, byref(_pdev)) >= 0:
+        _vt2 = ctypes.cast(_pdev, POINTER(POINTER(c_void_p)))[0]
+        _get_id = WINFUNCTYPE(ctypes.c_long, c_void_p, POINTER(c_void_p))(_vt2[5])
+        _ps = c_void_p()
+        if _get_id(_pdev, byref(_ps)) >= 0 and _ps:
+            open(_out, "w", encoding="utf-8").write(wstring_at(_ps))
+            _ole32.CoTaskMemFree(_ps)
+
+# 可选：先把 _target 设为系统默认（eConsole + eMultimedia），再读回来
+if _target:
+    _ppolicy = c_void_p()
+    if _ole32.CoCreateInstance(
+            byref(_guid("{870af99c-171d-4f9e-af0d-e63df40c2bc9}")), None, 23,
+            byref(_guid("{f8679f50-850a-41cf-9c72-430f290290c8}")),
+            byref(_ppolicy)) >= 0:
+        _vtp = ctypes.cast(_ppolicy, POINTER(POINTER(c_void_p)))[0]
+        _set_default = WINFUNCTYPE(ctypes.c_long, c_void_p, c_wchar_p, c_int)(_vtp[13])
+        for _r in (0, 1):
+            _set_default(_ppolicy, _target, _r)
+'''
+
+
+def _zi_jincheng_jieshiqi() -> str:
+    """子进程用的解释器：优先 pythonw.exe（不会闪控制台）。"""
+    try:
+        base = os.path.dirname(os.path.abspath(sys.executable))
+        for name in ("pythonw.exe", "python.exe"):
+            p = os.path.join(base, name)
+            if os.path.isfile(p):
+                return p
+    except Exception:
+        pass
+    return sys.executable
+
+
 class AudioCore:
     def __init__(self):
         self._enum: IMMDeviceEnumerator | None = None
@@ -666,6 +757,7 @@ class AudioCore:
                 is_default=(dev_id == default_id),
                 is_default_comms=(dev_id == default_comms),
             ))
+        out.sort(key=lambda d: _mingcheng_paixu(d.short_name))
         return out
 
     @staticmethod
@@ -770,6 +862,40 @@ class AudioCore:
         except Exception:
             return ""
 
+    def default_id_fresh(self, flow: int = eRender, role: int = eConsole,
+                         timeout: float = 20.0) -> str:
+        """只读：在子进程里读系统默认设备。"""
+        return self.set_default_and_read("", flow, role, timeout)
+
+    def set_default_and_read(self, device_id: str, flow: int = eRender,
+                             role: int = eConsole, timeout: float = 20.0) -> str:
+        """在独立子进程里读系统默认设备（唯一不被缓存影响的方式）。
+
+        见 _ZI_JINCHENG_DAIMA 上方的说明。失败返回空字符串。
+        """
+        out = os.path.join(tempfile.gettempdir(), f"pyar_def_{os.getpid()}.txt")
+        try:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+            args = [_zi_jincheng_jieshiqi(), "-S", "-c", _ZI_JINCHENG_DAIMA,
+                    str(int(flow)), str(int(role)), out]
+            if device_id:
+                args.append(device_id)
+            subprocess.run(args,
+                           timeout=timeout, creationflags=0x08000000,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with open(out, encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+        finally:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+
     def set_system_default(self, device_id: str, role: int = eConsole,
                            clear_first: bool = False) -> None:
         """把端点设为系统默认。
@@ -852,11 +978,23 @@ class AudioCore:
                 except Exception:
                     inst = ""
 
+                # 音量/静音接口必须从「这个会话自己的控制对象」上 QueryInterface 拿。
+                # 用 mgr.GetSimpleAudioVolume(分组参数) 拿到的可能是别的会话（同名分组的
+                # 会话、或默认会话），读写都落在那个对象上：界面显示的数不是它的真实值，
+                # 调滑块/静音也对这个应用没有任何作用。
                 vol_obj = None
+                try:
+                    vol_obj = ctl2.QueryInterface(ISimpleAudioVolume)
+                except Exception:
+                    vol_obj = None
+                if vol_obj is None:
+                    try:
+                        gp = ctl2.GetGroupingParam()
+                        vol_obj = mgr.GetSimpleAudioVolume(byref(gp), 0)
+                    except Exception:
+                        vol_obj = None
                 volume, muted = 1.0, False
                 try:
-                    gp = ctl2.GetGroupingParam()
-                    vol_obj = mgr.GetSimpleAudioVolume(byref(gp), 0)
                     volume = float(vol_obj.GetMasterVolume())
                     muted = bool(vol_obj.GetMute())
                 except Exception:
@@ -909,14 +1047,38 @@ class AudioCore:
 
     # -- 音量 ---------------------------------------------------------------
     @staticmethod
+    def _volume_obj(session: Session):
+        """会话的音量接口；枚举时没拿到就现从会话控制对象上补一次。"""
+        vol = session._vol
+        if vol is None and session._ctl is not None:
+            try:
+                vol = session._ctl.QueryInterface(ISimpleAudioVolume)
+                session._vol = vol
+            except Exception:
+                vol = None
+        return vol
+
+    @staticmethod
     def set_session_volume(session: Session, level: float) -> None:
-        if session._vol is not None:
-            session._vol.SetMasterVolume(max(0.0, min(1.0, float(level))), None)
+        vol = AudioCore._volume_obj(session)
+        if vol is not None:
+            vol.SetMasterVolume(max(0.0, min(1.0, float(level))), None)
 
     @staticmethod
     def set_session_mute(session: Session, mute: bool) -> None:
-        if session._vol is not None:
-            session._vol.SetMute(1 if mute else 0, None)
+        vol = AudioCore._volume_obj(session)
+        if vol is not None:
+            vol.SetMute(1 if mute else 0, None)
+
+
+def _mingcheng_paixu(name: str):
+    """按名称自然排序的键：00键盘 < 11黑色 < 22白色 < 333 < 4444。"""
+    key = []
+    for part in re.split(r"(\d+)", (name or "").lower()):
+        if not part:
+            continue
+        key.append((0, int(part), "") if part.isdigit() else (1, 0, part))
+    return key
 
 
 def _safe(fn, default=None):

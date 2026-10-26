@@ -107,6 +107,11 @@ class NoWheelSlider(QSlider):
         e.ignore()
 
 
+def _pct_text(value: float) -> str:
+    """电平数值：线性百分比（0~100%），跟电平条长度同一个口径。"""
+    return f"{int(round(max(0.0, min(1.0, float(value))) * 100))}%"
+
+
 class LevelBar(QWidget):
     """细条电平指示：绿 → 黄 → 红。"""
 
@@ -151,6 +156,7 @@ class LevelBar(QWidget):
 class DeviceCard(QFrame):
     clicked = Signal(str)
     volume_changed = Signal(str, float)   # (device_id, 0~1)
+    menu_requested = Signal(object, object)   # (本卡片, 全局坐标)
 
     def __init__(self, device: Device, color: str, dark: bool = False, parent=None):
         super().__init__(parent)
@@ -207,9 +213,18 @@ class DeviceCard(QFrame):
         mid.addWidget(self.pct, 0)
         lay.addLayout(mid)
 
-        # 第三行：电平条
+        # 第三行：电平条 + 数值
+        lv_row = QHBoxLayout()
+        lv_row.setContentsMargins(0, 0, 0, 0)
+        lv_row.setSpacing(5)
         self.level_bar = LevelBar(dark)
-        lay.addWidget(self.level_bar)
+        lv_row.addWidget(self.level_bar, 1)
+        self.level_label = QLabel("0%")
+        self.level_label.setObjectName("LevelPct")
+        self.level_label.setFixedWidth(34)
+        self.level_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        lv_row.addWidget(self.level_label, 0)
+        lay.addLayout(lv_row)
 
     # -- 交互 ---------------------------------------------------------------
     def _on_volume(self, value: int):
@@ -229,6 +244,7 @@ class DeviceCard(QFrame):
 
     def set_level(self, value: float):
         self.level_bar.set_level(value)
+        self.level_label.setText(_pct_text(value))
 
     def set_app_count(self, n: int):
         self.count_label.setText(f"{n} 个" if n else "")
@@ -244,6 +260,10 @@ class DeviceCard(QFrame):
                 return
             self.clicked.emit(self.device.id)
             e.accept()
+
+    def contextMenuEvent(self, e):
+        self.menu_requested.emit(self, e.globalPos())
+        e.accept()
 
     def set_active(self, on: bool):
         self.setProperty("active", "true" if on else "false")
@@ -271,11 +291,15 @@ class SessionRow(QFrame):
     volume_changed = Signal(object, float)
     mute_toggled = Signal(object, bool)
     fav_toggled = Signal(object)          # (session,)
+    clicked = Signal(object)              # (本行,)
+    menu_requested = Signal(object, object)   # (本行, 全局坐标)
+    clicked = Signal(object)
 
     def __init__(self, session: Session, devices: list[Device], dark: bool,
                  favorite: bool = False, parent=None):
         super().__init__(parent)
         self.setObjectName("SessionRow")
+        self.setProperty("sel", "false")
         self.session = session
         self.devices = devices
         self._fav = bool(favorite)
@@ -287,6 +311,13 @@ class SessionRow(QFrame):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 8, 12, 8)
         lay.setSpacing(10)
+
+        # 序号
+        self.no_label = QLabel("1")
+        self.no_label.setObjectName("RowNo")
+        self.no_label.setFixedWidth(18)
+        self.no_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        lay.addWidget(self.no_label, 0, Qt.AlignVCenter)
 
         # 进程图标
         self.icon_label = QLabel()
@@ -346,7 +377,16 @@ class SessionRow(QFrame):
         vol_col.addWidget(self.slider)
         self.level_bar = LevelBar(dark)
         self.level_bar.setFixedWidth(96)
-        vol_col.addWidget(self.level_bar)
+        level_row = QHBoxLayout()
+        level_row.setContentsMargins(0, 0, 0, 0)
+        level_row.setSpacing(5)
+        level_row.addWidget(self.level_bar)
+        self.level_label = QLabel("0%")
+        self.level_label.setObjectName("LevelPct")
+        self.level_label.setFixedWidth(34)
+        self.level_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        level_row.addWidget(self.level_label)
+        vol_col.addLayout(level_row)
         lay.addLayout(vol_col)
 
         self.vol_label = QLabel(f"{int(round(session.volume * 100))}%")
@@ -411,12 +451,38 @@ class SessionRow(QFrame):
         self.fav_btn.style().unpolish(self.fav_btn)
         self.fav_btn.style().polish(self.fav_btn)
 
+    def current_device_id(self) -> str:
+        return self.combo.currentData() or ""
+
+    def set_selected(self, on: bool):
+        val = "true" if on else "false"
+        if self.property("sel") != val:
+            self.setProperty("sel", val)
+            self.style().unpolish(self)
+            self.style().polish(self)
+            self.update()
+
+    def set_no(self, n: int):
+        self.no_label.setText(str(n))
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self)
+            e.accept()      # 不要再往上冒泡，否则点行会被当成点空白而清掉选中
+            return
+        super().mousePressEvent(e)
+
+    def contextMenuEvent(self, e):
+        self.menu_requested.emit(self, e.globalPos())
+        e.accept()
+
     def set_favorite(self, on: bool):
         self._fav = bool(on)
         self._sync_fav()
 
     def set_level(self, value: float):
         self.level_bar.set_level(value)
+        self.level_label.setText(_pct_text(value))
 
     def set_dark(self, dark: bool):
         self.level_bar.set_dark(dark)
@@ -441,6 +507,328 @@ class SessionRow(QFrame):
                 self.mute_btn.setText("🔇" if muted else "🔊")
         finally:
             self._suppress = False
+
+
+# --------------------------------------------------------------------------- #
+class HiddenRow(QFrame):
+    """「已移除」页里的条目：只有名字、路径和一个恢复按钮。"""
+
+    restore = Signal(str)          # (key,)
+    clicked = Signal(object)
+    menu_requested = Signal(object, object)
+
+    def __init__(self, key: str, name: str, path: str, dark: bool,
+                 no: int = 0, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SessionRow")
+        self.key = key
+        self.setFixedHeight(56)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(10)
+
+        no_label = QLabel(str(no))
+        no_label.setObjectName("RowNo")
+        no_label.setFixedWidth(18)
+        no_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        lay.addWidget(no_label, 0, Qt.AlignVCenter)
+
+        c = theme.palette(dark)
+        ic = QLabel()
+        ic.setFixedSize(32, 32)
+        icon = file_icon(path)
+        if icon.isNull():
+            ic.setPixmap(theme.device_pixmap(1, c["faint"], 20))
+        else:
+            ic.setPixmap(icon.pixmap(32, 32))
+        lay.addWidget(ic, 0, Qt.AlignVCenter)
+
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(2)
+        name_label = QLabel(name or key)
+        name_label.setObjectName("AppName")
+        col.addWidget(name_label)
+        path_label = QLabel(path or "")
+        path_label.setObjectName("AppSub")
+        path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._path_label = path_label
+        self._full_path = path or ""
+        col.addWidget(path_label)
+        lay.addLayout(col, 1)
+
+        btn = QPushButton("恢复")
+        btn.setObjectName("GhostBtn")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(lambda: self.restore.emit(self.key))
+        lay.addWidget(btn, 0, Qt.AlignVCenter)
+
+    def set_selected(self, on: bool):
+        val = "true" if on else "false"
+        if self.property("sel") != val:
+            self.setProperty("sel", val)
+            self.style().unpolish(self)
+            self.style().polish(self)
+            self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def contextMenuEvent(self, e):
+        self.menu_requested.emit(self, e.globalPos())
+        e.accept()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        _elide_path(self)
+
+
+# --------------------------------------------------------------------------- #
+class MemoryRow(QFrame):
+    """「记忆」页里的条目：应用 + 它记住的声卡（可下拉改、可删除）。"""
+
+    device_changed = Signal(str, str)   # (key, device_id)
+    removed = Signal(str)               # (key,)
+    menu_requested = Signal(object, object)   # (本行, 全局坐标)
+    clicked = Signal(object)
+
+    def __init__(self, key: str, name: str, path: str, device_id: str,
+                 devices: list[Device], dark: bool, no: int = 0, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SessionRow")
+        self.key = key
+        self._suppress = True
+        self.setFixedHeight(56)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(10)
+
+        no_label = QLabel(str(no))
+        no_label.setObjectName("RowNo")
+        no_label.setFixedWidth(18)
+        no_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        lay.addWidget(no_label, 0, Qt.AlignVCenter)
+
+        c = theme.palette(dark)
+        ic = QLabel()
+        ic.setFixedSize(32, 32)
+        icon = file_icon(path)
+        if icon.isNull():
+            ic.setPixmap(theme.device_pixmap(1, c["faint"], 20))
+        else:
+            ic.setPixmap(icon.pixmap(32, 32))
+        lay.addWidget(ic, 0, Qt.AlignVCenter)
+
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(2)
+        name_label = QLabel(name or key)
+        name_label.setObjectName("AppName")
+        col.addWidget(name_label)
+        path_label = QLabel(path or "路径不可读（只有进程名）")
+        path_label.setObjectName("AppSub")
+        path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._path_label = path_label
+        self._full_path = path or ""
+        col.addWidget(path_label)
+        lay.addLayout(col, 1)
+
+        self.combo = NoWheelComboBox()
+        self.combo.setMinimumWidth(150)
+        self.combo.setMaximumWidth(220)
+        self.combo.setCursor(Qt.PointingHandCursor)
+        self.combo.addItem("跟随系统（不记忆）", "")
+        name_count: dict[str, int] = {}
+        for d in devices:
+            name_count[d.short_name] = name_count.get(d.short_name, 0) + 1
+        for d in devices:
+            label = d.short_name
+            if name_count.get(label, 0) > 1:
+                label = f"{label} ({d.id[-6:-1]})"
+            self.combo.addItem(label, d.id)
+            self.combo.setItemData(self.combo.count() - 1, d.name, Qt.ToolTipRole)
+        if device_id and self.combo.findData(device_id) < 0:
+            # 记忆里的声卡现在不在（拔了 / 停用），仍然显示出来免得看着像没记住
+            self.combo.addItem(f"（不在线）{device_id[-6:-1]}", device_id)
+        self.combo.setCurrentIndex(max(0, self.combo.findData(device_id or "")))
+        self.combo.currentIndexChanged.connect(self._on_device)
+        lay.addWidget(self.combo, 0, Qt.AlignVCenter)
+
+        btn = QPushButton("删除")
+        btn.setObjectName("GhostBtn")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(lambda: self.removed.emit(self.key))
+        lay.addWidget(btn, 0, Qt.AlignVCenter)
+
+        self._suppress = False
+
+    def _on_device(self, _index: int):
+        if self._suppress:
+            return
+        self.device_changed.emit(self.key, self.combo.currentData() or "")
+
+    def set_selected(self, on: bool):
+        val = "true" if on else "false"
+        if self.property("sel") != val:
+            self.setProperty("sel", val)
+            self.style().unpolish(self)
+            self.style().polish(self)
+            self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def contextMenuEvent(self, e):
+        self.menu_requested.emit(self, e.globalPos())
+        e.accept()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        _elide_path(self)
+
+
+# --------------------------------------------------------------------------- #
+def _elide_path(row) -> None:
+    """管理行里的路径文字按可用宽度中段省略（窗口变窄时不挤掉右侧控件）。"""
+    lab = getattr(row, "_path_label", None)
+    if lab is None:
+        return
+    full = getattr(row, "_full_path", "") or ""
+    if not full:
+        return
+    lab.setText(lab.fontMetrics().elidedText(full, Qt.ElideMiddle, max(20, lab.width() - 2)))
+
+
+class ListGroupHeader(QFrame):
+    """可折叠的分组标题：▾ 运行中 (2)。"""
+
+    clicked = Signal(str)          # (分组 key)
+    action = Signal(str)           # 右侧按钮点击 (分组 key)
+
+    def __init__(self, title: str, count: int, opened: bool, group_key: str,
+                 dark: bool, parent=None, action_text: str = ""):
+        super().__init__(parent)
+        self.setObjectName("GroupHead")
+        self.setFixedHeight(26)
+        self.setCursor(Qt.PointingHandCursor)
+        self.group_key = group_key
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(6)
+        lab = QLabel(f"{'▾' if opened else '▸'} {title} ({count})")
+        lab.setObjectName("GroupTitle")
+        lay.addWidget(lab)
+        lay.addStretch(1)
+        if action_text:
+            btn = QPushButton(action_text)
+            btn.setObjectName("GhostBtn")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(22)
+            btn.clicked.connect(lambda: self.action.emit(self.group_key))
+            lay.addWidget(btn)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self.group_key)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+
+# --------------------------------------------------------------------------- #
+class FavRow(QFrame):
+    """「收藏」页里的条目：不管应用在不在运行都能看到、能取消收藏。"""
+
+    unfav = Signal(str)            # (key,)
+    clicked = Signal(object)
+    menu_requested = Signal(object, object)
+
+    def __init__(self, key: str, name: str, path: str, running: bool,
+                 dark: bool, no: int = 0, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SessionRow")
+        self.key = key
+        self.setFixedHeight(56)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(10)
+
+        no_label = QLabel(str(no))
+        no_label.setObjectName("RowNo")
+        no_label.setFixedWidth(18)
+        no_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        lay.addWidget(no_label, 0, Qt.AlignVCenter)
+
+        c = theme.palette(dark)
+        ic = QLabel()
+        ic.setFixedSize(32, 32)
+        icon = file_icon(path)
+        if icon.isNull():
+            ic.setPixmap(theme.device_pixmap(1, c["faint"], 20))
+        else:
+            ic.setPixmap(icon.pixmap(32, 32))
+        lay.addWidget(ic, 0, Qt.AlignVCenter)
+
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(2)
+        name_label = QLabel(name or key)
+        name_label.setObjectName("AppName")
+        col.addWidget(name_label)
+        path_label = QLabel(path or "只有进程名，路径不可读")
+        path_label.setObjectName("AppSub")
+        path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._path_label = path_label
+        self._full_path = path or ""
+        col.addWidget(path_label)
+        lay.addLayout(col, 1)
+
+        state = QLabel("运行中" if running else "未运行")
+        state.setObjectName("FavState")
+        lay.addWidget(state, 0, Qt.AlignVCenter)
+
+        btn = QPushButton("取消收藏")
+        btn.setObjectName("GhostBtn")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(lambda: self.unfav.emit(self.key))
+        lay.addWidget(btn, 0, Qt.AlignVCenter)
+
+    def set_selected(self, on: bool):
+        val = "true" if on else "false"
+        if self.property("sel") != val:
+            self.setProperty("sel", val)
+            self.style().unpolish(self)
+            self.style().polish(self)
+            self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def contextMenuEvent(self, e):
+        self.menu_requested.emit(self, e.globalPos())
+        e.accept()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        _elide_path(self)
 
 
 # --------------------------------------------------------------------------- #

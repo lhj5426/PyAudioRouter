@@ -8,11 +8,12 @@ from __future__ import annotations
 import math
 import os
 import sys
+import threading
 import time
 import traceback
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QFrame, QGraphicsDropShadowEffect,
                                QHBoxLayout, QLabel, QLayout, QMenu, QPushButton, QScrollArea,
                                QSizeGrip, QSystemTrayIcon, QVBoxLayout, QWidget)
@@ -20,15 +21,25 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QFrame, QGraphicsDrop
 import audio_core as ac
 import theme
 from store import Store
-from ui_widgets import DeviceCard, EmptyHint, SessionRow, TitleBar
+from ui_widgets import (DeviceCard, EmptyHint, FavRow, HiddenRow, ListGroupHeader,
+                        MemoryRow, SessionRow, TitleBar)
 
 
 APP_TITLE = "多声卡窗口管理"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# 多久核对一次系统默认设备（毫秒）。只改这一行。
+jian_ge_haomiao = 3000
+
+# 电平：条长和数值都用线性百分比（0~100%），跟常见的混音器读数一致
+def _db_level(peak: float) -> float:
+    """峰值 -> 电平条位置（线性 0~1），数值按这个换算成百分比。"""
+    return max(0.0, min(1.0, float(peak)))
+
 
 class MainWindow(QWidget):
     _default_ready = Signal(str)
+    _need_refresh = Signal()
     def __init__(self):
         super().__init__()
         self.core = ac.AudioCore()
@@ -40,13 +51,20 @@ class MainWindow(QWidget):
         self.devices: list[ac.Device] = []
         self._dev_sig: tuple | None = None
         self.show_fav_only = False
+        self.view_mode = 0        # 0 全部 / 1 收藏 / 2 已移除 / 3 记忆
+        self._list_mode = 0       # 当前列表页实际渲染的模式（0 = 会话列表）
+        self._hidden_sig: tuple | None = None
+        self._mem_sig: tuple | None = None
+        self._fav_sig: tuple | None = None
+        self._fav_open = {"run": True, "idle": True}   # 收藏页两个分组是否展开
         self.selected_device: str | None = None
-        self._default_override = ""
-        self._override_until = 0.0
-        self._sub_busy = False
         self._route_ts: dict[int, float] = {}
+        self._first_seen: dict[int, float] = {}
         self._refresh_tick = 0
         self._applied: set[str] = set()
+        self._sys_default_id = ""      # 当前确认过的系统默认设备 id（只由子进程/系统通知写入）
+        self._sel: set[str] = set()    # 选中的应用行 key
+        self._sel_anchor: str | None = None
 
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(theme.app_icon(64))
@@ -65,20 +83,17 @@ class MainWindow(QWidget):
         self.timer.timeout.connect(lambda: self.refresh(full=False))
         self.timer.start(1500)
 
-        # 轻量轮询：只读默认设备 ID（单次 COM 调用），变了立刻重绘设备卡片。
-        # 这样在录制软件 / 系统托盘里切默认设备，这边 0.5 秒内跟上。
-        self._last_default_id = ""
-        self.dev_timer = QTimer(self)
-        self.dev_timer.timeout.connect(self._check_default_device)
-        self.dev_timer.start(500)
-
-        # 系统设备变化通知：默认设备切换、设备插拔时立即刷新（比 500ms 轮询更及时）
+        # 系统默认设备：只认「子进程读到的值」。
+        # 本进程内的 GetDefaultAudioEndpoint 被 MMDevAPI 按进程缓存，外部改默认设备
+        # 之后会一直返回旧值，徽章就钉死在旧声卡上；所以定时用子进程核对。
+        self._probe_busy = False
+        self._default_ready.connect(self._apply_probed_default)
+        self._need_refresh.connect(self._on_need_refresh)
         self.core.watch_devices(self._on_device_event)
-
-        # 启动后用独立子进程校正一次默认设备（本进程读到的可能是缓存值）。
-        # 只做一次：切换默认设备走系统通知，不再起子进程，避免每次切换都卡一下。
-        self._default_ready.connect(self._apply_default_override)
-        QTimer.singleShot(1500, self._refresh_default_from_subprocess)
+        self.dev_timer = QTimer(self)
+        self.dev_timer.timeout.connect(self._probe_default)
+        self.dev_timer.start(jian_ge_haomiao)
+        QTimer.singleShot(300, self._probe_default)
 
         # 电平条刷新（80ms，只读 GetPeakValue，开销很小）
         self.meter_timer = QTimer(self)
@@ -86,6 +101,14 @@ class MainWindow(QWidget):
         self.meter_timer.start(80)
 
         self._build_tray()
+
+        # Ctrl+A 全选当前页（全部/收藏/已移除/记忆 都生效）
+        self.sc_select_all = QShortcut(QKeySequence.SelectAll, self)
+        self.sc_select_all.setContext(Qt.WindowShortcut)
+        self.sc_select_all.activated.connect(self._select_all)
+        self.sc_delete = QShortcut(QKeySequence.Delete, self)
+        self.sc_delete.setContext(Qt.WindowShortcut)
+        self.sc_delete.activated.connect(self._on_delete_key)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -163,16 +186,22 @@ class MainWindow(QWidget):
         self.filter_group = QButtonGroup(self)
         self.btn_all = QPushButton("全部")
         self.btn_fav = QPushButton("收藏")
-        for b in (self.btn_all, self.btn_fav):
+        self.btn_hidden = QPushButton("已移除")
+        self.btn_mem = QPushButton("记忆")
+        for b in (self.btn_all, self.btn_fav, self.btn_hidden, self.btn_mem):
             b.setObjectName("SegBtn")
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
         self.btn_all.setChecked(True)
         self.filter_group.addButton(self.btn_all, 0)
         self.filter_group.addButton(self.btn_fav, 1)
+        self.filter_group.addButton(self.btn_hidden, 2)
+        self.filter_group.addButton(self.btn_mem, 3)
         self.filter_group.idClicked.connect(self._on_filter_changed)
         head.addWidget(self.btn_all)
         head.addWidget(self.btn_fav)
+        head.addWidget(self.btn_hidden)
+        head.addWidget(self.btn_mem)
 
         head.addStretch(1)
         self.btn_clear = QPushButton("全部恢复默认")
@@ -193,6 +222,7 @@ class MainWindow(QWidget):
         self.session_layout.setSpacing(8)
         self.session_layout.addStretch(1)
         self.session_scroll.setWidget(self.session_host)
+        self.session_host.installEventFilter(self)
         lay.addWidget(self.session_scroll, 1)
 
         # ---- 状态栏
@@ -298,6 +328,7 @@ class MainWindow(QWidget):
 
     def _quit(self):
         self.timer.stop()
+        self.dev_timer.stop()
         self._save_geometry()
         try:
             self.store.save()
@@ -315,22 +346,35 @@ class MainWindow(QWidget):
         except Exception:
             self.devices = []
 
-        # 用「子进程读到的真值 / 系统通知带来的 id」覆盖缓存值。
-        # 不设过期：本进程的 GetDefaultAudioEndpoint 会一直返回旧值，
-        # 只有系统真的切换（收到 OnDefaultDeviceChanged）时才更新它。
-        if self._default_override:
-            if time.monotonic() < self._override_until:
-                for d in self.devices:
-                    d.is_default = (d.id == self._default_override)
-            else:
-                self._default_override = ""
+        # 默认徽章只认子进程读到的值（本进程读到的可能是缓存的旧值）
+        if self._sys_default_id:
+            for d in self.devices:
+                d.is_default = (d.id == self._sys_default_id)
 
         # 设备有变化（默认设备切换、插拔）就重建卡片，外部改默认也能反映出来
         sig = tuple((d.id, d.is_default) for d in self.devices)
         if not self.device_layout.count() or sig != self._dev_sig:
             self._dev_sig = sig
             self._rebuild_devices()
-        self._last_default_id = next((d.id for d in self.devices if d.is_default), "")
+
+        # 「收藏」/「已移除」/「记忆」页：不列会话
+        if self.view_mode in (1, 2, 3):
+            self._update_section_label()
+            if self.view_mode == 1:
+                self._show_fav_rows()
+            elif self.view_mode == 2:
+                self._show_hidden_rows()
+            else:
+                self._show_memory_rows()
+            self._update_device_counts()
+            self._update_status()
+            return
+        if self._list_mode != 0:
+            self._clear_sessions()
+            self._list_mode = 0
+            self._hidden_sig = None
+            self._mem_sig = None
+            self._fav_sig = None
 
         try:
             sessions = self.core.sessions(self.flow)
@@ -338,11 +382,24 @@ class MainWindow(QWidget):
             sessions = []
         if not self.store.settings.get("show_system_sounds", False):
             sessions = [s for s in sessions if not s.is_system]
+        # 已移除的应用不再出现在列表里
+        sessions = [s for s in sessions
+                    if not self.store.is_hidden(s.process_name, s.exe_path)]
         if self.show_fav_only:
             sessions = [s for s in sessions
                         if self.store.is_fav(s.process_name, s.exe_path)]
         if self.selected_device:
             sessions = [s for s in sessions if s.device_id == self.selected_device]
+
+        # 新出现的应用排最上面，已有的按出现时间倒序（顺序稳定，不会来回跳）
+        now = time.monotonic()
+        alive_pids = {x.pid for x in sessions if x.pid}
+        self._first_seen = {p: t for p, t in self._first_seen.items() if p in alive_pids}
+        for x in sessions:
+            if x.pid and x.pid not in self._first_seen:
+                self._first_seen[x.pid] = now
+        sessions.sort(key=lambda x: -self._first_seen.get(x.pid, 0.0))
+
         self._update_section_label()
 
         self._sync_sessions(sessions)
@@ -350,92 +407,53 @@ class MainWindow(QWidget):
         self._refresh_tick += 1
         self._update_status()
 
-    def _read_default_fresh(self) -> str:
-        """用一个独立子进程读系统默认设备。
-
-        audiosrv 会按进程缓存默认设备，本进程内怎么读都可能拿到旧值；
-        新起的进程读到的才是当前真实值。
-
-        用 pythonw.exe（无控制台，不会闪黑框）启动，结果写临时文件回传——
-        pythonw 没有 stdout，抓不到 print 输出。
-        """
-        try:
-            import subprocess
-            import tempfile
-            base = os.path.dirname(sys.executable)
-            pyw = os.path.join(base, "pythonw.exe")
-            py = pyw if os.path.isfile(pyw) else os.path.join(base, "python.exe")
-            out = os.path.join(tempfile.gettempdir(), f"pyar_def_{os.getpid()}.txt")
-            code = ("import sys, comtypes;"
-                    f"sys.path.insert(0, {HERE!r});"
-                    "import audio_core as ac;"
-                    "comtypes.CoInitialize();"
-                    "c = ac.AudioCore(); c.initialize();"
-                    f"open({out!r}, 'w', encoding='utf-8').write(c.get_default_id(0, 0))")
-            subprocess.run([py, "-c", code], timeout=25,
-                           creationflags=0x08000000,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            with open(out, encoding="utf-8") as f:
-                did = f.read().strip()
-            try:
-                os.remove(out)
-            except Exception:
-                pass
-            return did
-        except Exception:
-            return ""
-
-    def _refresh_default_from_subprocess(self):
-        # 子进程启动要 1~2 秒，放后台线程；同时只允许一个在跑
-        if getattr(self, "_sub_busy", False):
+    def _probe_default(self):
+        """后台线程起子进程读一次系统默认设备，读完用信号回主线程。"""
+        if self._probe_busy:
             return
-        self._sub_busy = True
+        self._probe_busy = True
 
         def work():
             try:
-                did = self._read_default_fresh()
+                did = self.core.default_id_fresh(self.flow)
                 if did:
-                    self._default_ready.emit(did)      # 跨线程安全
+                    self._default_ready.emit(did)
             finally:
-                self._sub_busy = False
+                self._probe_busy = False
 
-        import threading
         threading.Thread(target=work, daemon=True).start()
 
-    def _apply_default_override(self, device_id: str):
-        if not device_id:
+    def _apply_probed_default(self, device_id: str):
+        """拿到真实的系统默认设备就立刻改徽章。"""
+        if not device_id or device_id == self._sys_default_id:
             return
-        self._default_override = device_id
-        self._override_until = time.monotonic() + 60.0
+        self._sys_default_id = device_id
+        self.refresh(full=True)
+
+    def _on_need_refresh(self):
+        """系统通知（设备插拔等）触发的刷新，回到主线程再动界面。"""
         self.refresh(full=True)
 
     def _on_device_event(self, flow: int = -1, role: int = -1, device_id: str = ""):
-        """COM 通知回调：只当成「该重新读一次」的信号。
-
-        回调里带的 device_id 不能直接用——audiosrv 给的可能还是缓存旧值，
-        一旦拿它当覆盖值，界面就会锁死在旧设备上（之前就是这个 bug）。
-        所以统一改成用子进程重新读真值。
-        """
-        if flow == ac.eRender and role in (ac.eConsole, ac.eMultimedia) and device_id:
-            self._default_override = device_id
-            self._override_until = time.monotonic() + 60.0
-        QTimer.singleShot(50, lambda: self.refresh(full=True))
-
-    def _check_default_device(self):
-        """0.5 秒一次的轻量检测：默认设备被别人改了就把界面跟上。"""
-        cur = self.core.get_default_id(self.flow)
-        if not cur or cur == self._last_default_id:
-            return
-        self._last_default_id = cur
-        self.refresh(full=True)
+        """COM 通知回调：跑在系统的线程上，不能直接碰界面。"""
+        if flow == ac.eRender and role == ac.eConsole and device_id:
+            # 通知里带的就是新的默认设备，直接采用，界面立刻跟上
+            self._default_ready.emit(device_id)
+        if flow in (-1, ac.eRender):
+            self._probe_default()
+        self._need_refresh.emit()
 
     def _force_refresh(self):
         """手动刷新：强制重建设备卡片（平时只在设备真变了才重建）。"""
         self._dev_sig = None
+        self._probe_default()
         self.refresh(full=True)
 
     def _on_filter_changed(self, idx: int):
+        self.view_mode = idx
         self.show_fav_only = (idx == 1)
+        self._sel.clear()
+        self._sel_anchor = None
         # 切换「全部 / 收藏」都取消声卡筛选：全部=所有应用，收藏=所有收藏的应用
         self.selected_device = None
         self.refresh(full=True)
@@ -453,10 +471,35 @@ class MainWindow(QWidget):
         name = next((d.short_name for d in self.devices if d.id == self.selected_device), "")
         if name:
             self.section_label.setText(f"{name} 上的应用")
+        elif self.view_mode == 2:
+            self.section_label.setText("已移除的应用")
+        elif self.view_mode == 3:
+            self.section_label.setText("记住的声卡分配")
         elif self.show_fav_only:
             self.section_label.setText("收藏的应用")
         else:
             self.section_label.setText("正在播放的应用")
+
+    def _on_device_menu(self, card, gpos):
+        """声卡卡片右键：设为系统默认。"""
+        dev = card.device
+        is_default = (dev.id == self._sys_default_id)
+        menu = QMenu(self)
+        act = menu.addAction(("✓ 当前系统默认" if is_default else "设为系统默认"))
+        act.setData("default")
+        act.setEnabled(not is_default)
+        picked = menu.exec(gpos)
+        if picked is None or str(picked.data() or "") != "default":
+            return
+        new_id = self.core.set_default_and_read(dev.id, self.flow)
+        if new_id:
+            self._sys_default_id = new_id
+        self._dev_sig = None
+        self.refresh(full=True)
+        if new_id == dev.id:
+            self._flash_status(f"已把 {dev.short_name} 设为系统默认")
+        else:
+            self._flash_status("设置未生效：Windows 没有接受这次默认设备切换")
 
     def _on_device_volume(self, device_id: str, level: float):
         self.core.set_device_volume(device_id, level)
@@ -466,21 +509,9 @@ class MainWindow(QWidget):
         for i in range(self.device_layout.count()):
             w = self.device_layout.itemAt(i).widget()
             if isinstance(w, DeviceCard):
-                peak = self.core.device_peak(w.device.id)
-                if peak <= 0.0:
-                    lv = 0.0
-                else:
-                    db = 20.0 * math.log10(peak)
-                    lv = max(0.0, min(1.0, (db + 48.0) / 48.0))
-                w.set_level(lv)
+                w.set_level(_db_level(self.core.device_peak(w.device.id)))
         for row in self.rows.values():
-            peak = row.session.peak()
-            if peak <= 0.0:
-                level = 0.0
-            else:
-                db = 20.0 * math.log10(peak)
-                level = max(0.0, min(1.0, (db + 48.0) / 48.0))
-            row.set_level(level)
+            row.set_level(_db_level(row.session.peak()))
 
     def _effective_device(self, s: ac.Session) -> str:
         """下拉显示的值：以你在本程序里的设置为准。
@@ -512,6 +543,7 @@ class MainWindow(QWidget):
             card = DeviceCard(d, c["sub"], self.dark)
             card.clicked.connect(self._on_device_clicked)
             card.volume_changed.connect(self._on_device_volume)
+            card.menu_requested.connect(self._on_device_menu)
             card.set_active(d.id == self.selected_device)
             card.set_volume(self.core.device_volume(d.id))
             self.device_layout.addWidget(card, 1)
@@ -572,6 +604,14 @@ class MainWindow(QWidget):
                     if not ic.isNull():
                         row.icon_label.setPixmap(ic.pixmap(32, 32))
 
+        # 按 sessions 顺序重排行（新应用插到最上面）
+        ordered = [self.rows[k] for k in (f"{x.pid}:{(x.process_name or '').lower()}"
+                                          if not x.is_system else "sys" for x in sessions)
+                   if k in self.rows]
+        for i, row in enumerate(ordered):
+            self.session_layout.insertWidget(i, row)
+            row.set_no(i + 1)
+
         for key in list(self.rows.keys()):
             if key not in alive:
                 row = self.rows.pop(key)
@@ -584,6 +624,7 @@ class MainWindow(QWidget):
                     pass
                 row.deleteLater()
                 self._applied.discard(key)
+                self._sel.discard(key)
 
         if not self.rows:
             text = ("收藏里还没有正在运行的程序\n点应用行右边的 ☆ 就能收藏"
@@ -618,6 +659,9 @@ class MainWindow(QWidget):
         row.volume_changed.connect(self._on_volume_changed)
         row.mute_toggled.connect(self._on_mute_toggled)
         row.fav_toggled.connect(self._on_fav_toggled)
+        row.clicked.connect(self._on_row_clicked)
+        row.menu_requested.connect(self._on_row_menu)
+        row.key = key
         self.session_layout.insertWidget(self.session_layout.count() - 1, row)
         self.rows[key] = row
 
@@ -717,6 +761,534 @@ class MainWindow(QWidget):
         else:
             self._update_status()
 
+    # ---------------------------------------------------- 选择与右键菜单
+    def _row_keys_in_order(self) -> list[str]:
+        """按界面顺序列出所有带 key 的行（会话行和管理页的行都算）。"""
+        rev = {id(r): k for k, r in self.rows.items()}
+        out: list[str] = []
+        for i in range(self.session_layout.count()):
+            w = self.session_layout.itemAt(i).widget()
+            k = rev.get(id(w)) or getattr(w, "key", None)
+            if k:
+                out.append(k)
+        return out
+
+    def _selected_keys(self) -> list[str]:
+        return [k for k in self._row_keys_in_order() if k in self._sel]
+
+    def _on_row_clicked(self, row):
+        key = getattr(row, "key", "")
+        if not key:
+            return
+        mods = QApplication.keyboardModifiers()
+        keys = self._row_keys_in_order()
+        if mods & Qt.ControlModifier:
+            if key in self._sel:
+                self._sel.discard(key)
+            else:
+                self._sel.add(key)
+            self._sel_anchor = key
+        elif mods & Qt.ShiftModifier and self._sel_anchor in keys and key in keys:
+            i, j = keys.index(self._sel_anchor), keys.index(key)
+            lo, hi = min(i, j), max(i, j)
+            self._sel = set(keys[lo:hi + 1])
+        else:
+            self._sel = {key}
+            self._sel_anchor = key
+        self._apply_selection()
+
+    def _apply_selection(self):
+        rev = {id(r): k for k, r in self.rows.items()}
+        for i in range(self.session_layout.count()):
+            w = self.session_layout.itemAt(i).widget()
+            if w is None:
+                continue
+            k = rev.get(id(w)) or getattr(w, "key", None)
+            if k and hasattr(w, "set_selected"):
+                w.set_selected(k in self._sel)
+
+    def _select_all(self):
+        """Ctrl+A / 右键全选：当前页所有行全选，再按一次取消。"""
+        keys = self._row_keys_in_order()
+        if not keys:
+            return
+        self._sel = set() if len(self._sel) >= len(keys) else set(keys)
+        self._sel_anchor = keys[0] if self._sel else None
+        self._apply_selection()
+
+    def eventFilter(self, obj, ev):
+        """列表空白区域：左键取消选中，右键出全局菜单。"""
+        if obj is getattr(self, "session_host", None):
+            if ev.type() == QEvent.MouseButtonPress:
+                if ev.button() == Qt.LeftButton and self._sel:
+                    self._sel.clear()
+                    self._sel_anchor = None
+                    self._apply_selection()
+            elif ev.type() == QEvent.ContextMenu:
+                self._show_list_menu(ev.globalPos())
+                return True
+        return super().eventFilter(obj, ev)
+
+    def _show_list_menu(self, gpos):
+        menu = QMenu(self)
+        act_selall = menu.addAction("取消全选" if self._sel else "全选")
+        act_selall.setData("selectall")
+        menu.addSeparator()
+        act_auto = menu.addAction("自动套用记忆规则")
+        act_auto.setCheckable(True)
+        act_auto.setChecked(bool(self.store.settings.get("auto_apply", True)))
+        act_auto.setData("auto")
+        if self.view_mode == 1:
+            idle = self._idle_fav_keys()
+            if idle:
+                act_idle = menu.addAction(f"取消所有未运行的收藏（{len(idle)} 个）")
+                act_idle.setData("unfav_idle")
+        menu.addSeparator()
+        if self.view_mode != 3:
+            act_mem = menu.addAction("管理记忆…")
+            act_mem.setData("memory")
+        if self.view_mode != 1:
+            act_fav = menu.addAction("管理收藏…")
+            act_fav.setData("fav")
+        menu.addSeparator()
+        act_reset = menu.addAction("全部恢复默认")
+        act_reset.setData("reset")
+
+        picked = menu.exec(gpos)
+        what = str(picked.data() or "") if picked is not None else ""
+        if what == "selectall":
+            self._select_all()
+        elif what == "unfav_idle":
+            self._unfav_all_idle()
+        elif what == "auto":
+            self._set_auto_apply(act_auto.isChecked())
+        elif what == "memory":
+            self._goto_view(3)
+        elif what == "fav":
+            self._goto_view(1)
+        elif what == "reset":
+            self.reset_all()
+
+    def _set_auto_apply(self, on: bool):
+        self.store.set_setting("auto_apply", bool(on))
+        if hasattr(self, "act_auto"):
+            self.act_auto.setChecked(bool(on))
+        self._update_status()
+        self._flash_status("自动套用：开" if on else "自动套用：关")
+
+    def _goto_view(self, idx: int):
+        btn = self.filter_group.button(idx)
+        if btn is not None:
+            btn.setChecked(True)
+        self._on_filter_changed(idx)
+
+    def _selected_rows(self) -> list:
+        return [self.rows[k] for k in self._row_keys_in_order() if k in self._sel]
+
+    def _on_row_menu(self, row, gpos):
+        key = getattr(row, "key", "")
+        if key and key not in self._sel:
+            self._sel = {key}
+            self._sel_anchor = key
+            self._apply_selection()
+        rows = self._selected_rows()
+        if not rows:
+            return
+        n = len(rows)
+        fav_flags = [self.store.is_fav(r.session.process_name, r.session.exe_path) for r in rows]
+        menu = QMenu(self)
+        act_remove = menu.addAction(f"移除应用（{n} 个）" if n > 1 else "移除应用")
+        act_remove.setData("remove")
+        menu.addSeparator()
+        act_addfav = menu.addAction(f"添加收藏（{n} 个）" if n > 1 else "添加收藏")
+        act_addfav.setData("addfav")
+        act_addfav.setEnabled(not all(fav_flags))
+        act_unfav = menu.addAction(f"取消收藏（{n} 个）" if n > 1 else "取消收藏")
+        act_unfav.setData("unfav")
+        act_unfav.setEnabled(any(fav_flags))
+
+        picked = menu.exec(gpos)
+        what = str(picked.data() or "") if picked is not None else ""
+        try:
+            if what == "remove":
+                self._remove_selected(rows)
+            elif what == "addfav":
+                self._add_fav_selected(rows)
+            elif what == "unfav":
+                self._unfav_selected(rows)
+        except Exception as exc:
+            self._flash_status(f"操作失败：{exc}")
+
+    def _remove_selected(self, rows):
+        """把这个应用整个从本程序里移除：设备记忆、收藏、条目一起清掉。
+
+        应用本身不关闭、不修改、不卸载；Windows 那边的按应用分配也还原成跟随系统，
+        否则会出现「界面上没有了、声音却还固定在那块声卡」的死角。
+        移除后可在「已移除」页恢复。
+        """
+        n = 0
+        for row in rows:
+            s = row.session
+            key = getattr(row, "key", "")
+            if self.store.is_hidden(s.process_name, s.exe_path):
+                continue
+            self.store.remove(s.process_name, s.exe_path)
+            if self.store.is_fav(s.process_name, s.exe_path):
+                self.store.toggle_fav(s.process_name, s.exe_path)
+            self.store.hide(s.process_name, s.exe_path)
+            self._applied.discard(key)
+            self._sel.discard(key)
+            if s.pid:
+                try:
+                    self.core.route_process(s.pid, "", self.flow)
+                except Exception:
+                    pass
+            n += 1
+        self._apply_selection()
+        self.refresh(full=True)
+        if n:
+            self._flash_status(f"已移除 {n} 个应用（可在「已移除」页恢复）")
+        else:
+            self._flash_status("选中的应用都已移除")
+
+    def _clear_sessions(self):
+        """清空会话列表（切到「已移除」页或切回来时用）。"""
+        self._clear_layout(self.session_layout)
+        self.session_layout.addStretch(1)
+        self.rows.clear()
+        self._sel.clear()
+        self._sel_anchor = None
+        for attr in ("_empty_hint", "_empty_text"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+    def _show_hidden_rows(self):
+        items = self.store.hidden_items()
+        sig = tuple(sorted(items))
+        if self._list_mode == 2 and sig == self._hidden_sig:
+            return
+        self._clear_sessions()
+        self._list_mode = 2
+        self._hidden_sig = sig
+        if not items:
+            hint = EmptyHint("还没有移除任何应用\n在应用行上右键 → 移除应用")
+            self.session_layout.insertWidget(0, hint)
+            self._empty_hint = hint
+            self._empty_text = "hidden"
+            return
+        ordered = sorted(items.items(),
+                         key=lambda kv: (str(kv[1].get("name") or "").lower(), kv[0]))
+        for i, (key, info) in enumerate(ordered):
+            row = HiddenRow(key, str(info.get("name") or key), str(info.get("path") or ""),
+                            self.dark, i + 1)
+            row.restore.connect(self._restore_hidden)
+            row.clicked.connect(self._on_row_clicked)
+            row.menu_requested.connect(self._on_hidden_menu)
+            self.session_layout.insertWidget(self.session_layout.count() - 1, row)
+
+    @staticmethod
+    def _split_key(key: str) -> tuple[str, str]:
+        """把存储键还原成 (进程名, 路径)。"""
+        k = (key or "").strip()
+        if "\\" in k or "/" in k:
+            base = k.replace("/", "\\").rsplit("\\", 1)[-1]
+            name = base[:-4] if base.lower().endswith(".exe") else base
+            return name, k
+        return k, ""
+
+    def _show_fav_rows(self):
+        """「收藏」页：所有收藏都列出来（含没在运行的），按运行中/未运行分组，可折叠。"""
+        favs = self.store.favorites()
+        try:
+            sessions = self.core.sessions(self.flow)
+        except Exception:
+            sessions = []
+        live: dict[str, ac.Session] = {}
+        for x in sessions:
+            live.setdefault(self.store.key(x.process_name, x.exe_path), x)
+        sig = (frozenset(favs), frozenset(live),
+               self._fav_open["run"], self._fav_open["idle"])
+        if self._list_mode == 1 and sig == self._fav_sig:
+            return
+        self._clear_sessions()
+        self._list_mode = 1
+        self._fav_sig = sig
+        if not favs:
+            hint = EmptyHint("还没有收藏\n在应用行右边点 ☆ 就能收藏")
+            self.session_layout.insertWidget(0, hint)
+            self._empty_hint = hint
+            self._empty_text = "fav"
+            return
+        running = sorted(k for k in favs if k in live)
+        idle = sorted(k for k in favs if k not in live)
+        no = 0
+        for gkey, title, keys in (("run", "运行中", running), ("idle", "未运行", idle)):
+            if not keys:
+                continue
+            opened = bool(self._fav_open.get(gkey, True))
+            head = ListGroupHeader(
+                title, len(keys), opened, gkey, self.dark,
+                action_text="取消全部收藏" if gkey == "idle" else "")
+            head.clicked.connect(self._on_fav_group)
+            head.action.connect(lambda _g, _k=tuple(keys): self._unfav_keys(list(_k)))
+            self.session_layout.insertWidget(self.session_layout.count() - 1, head)
+            if not opened:
+                no += len(keys)          # 折叠时也占号，展开后序号不变
+                continue
+            for key in keys:
+                no += 1
+                s = live.get(key)
+                name, path = self._split_key(key)
+                row = FavRow(key,
+                             s.process_name if s else name,
+                             s.exe_path if s else path,
+                             s is not None, self.dark, no)
+                row.unfav.connect(self._on_fav_row_remove)
+                row.clicked.connect(self._on_row_clicked)
+                row.menu_requested.connect(self._on_fav_menu)
+                self.session_layout.insertWidget(self.session_layout.count() - 1, row)
+
+    def _on_fav_group(self, gkey: str):
+        self._fav_open[gkey] = not self._fav_open.get(gkey, True)
+        self._fav_sig = None
+        self.refresh(full=True)
+
+    def _on_fav_row_remove(self, key: str):
+        name, path = self._split_key(key)
+        self.store.remove_fav(key)
+        for row in list(self.rows.values()):
+            s = row.session
+            if self.store.key(s.process_name, s.exe_path) == str(key).lower():
+                row.set_favorite(False)
+        self._fav_sig = None
+        self.refresh(full=True)
+        self._flash_status(f"已取消收藏 {name}")
+
+    def _show_memory_rows(self):
+        """「记忆」页：列出所有「应用 → 声卡」的记忆，可改可删。"""
+        rules = self.store.all_rules()
+        sig = (tuple(sorted((k, str(v.get("device") or "")) for k, v in rules.items())),
+               tuple(d.id for d in self.devices))
+        if self._list_mode == 3 and sig == self._mem_sig:
+            return
+        self._clear_sessions()
+        self._list_mode = 3
+        self._mem_sig = sig
+        if not rules:
+            hint = EmptyHint("还没有记忆\n在应用行的下拉里选一块声卡，就会记住它")
+            self.session_layout.insertWidget(0, hint)
+            self._empty_hint = hint
+            self._empty_text = "memory"
+            return
+        ordered = sorted(rules.items(),
+                         key=lambda kv: (str(kv[1].get("name") or "").lower(), kv[0]))
+        for i, (key, r) in enumerate(ordered):
+            row = MemoryRow(key, str(r.get("name") or key), str(r.get("path") or ""),
+                            str(r.get("device") or ""), self.devices, self.dark, i + 1)
+            row.device_changed.connect(self._on_memory_device)
+            row.removed.connect(self._on_memory_remove)
+            row.clicked.connect(self._on_row_clicked)
+            row.menu_requested.connect(self._on_memory_menu)
+            self.session_layout.insertWidget(self.session_layout.count() - 1, row)
+
+    def _on_memory_device(self, key: str, device_id: str, quiet: bool = False):
+        """在「记忆」页里改某条记忆记住的声卡。"""
+        r = self.store.all_rules().get(key)
+        if not r:
+            return
+        name = str(r.get("name") or "")
+        path = str(r.get("path") or "")
+        dev_name = next((d.short_name for d in self.devices if d.id == device_id), "")
+        self.store.set(name, device_id, self.flow, path, dev_name)
+        # 应用正在播放就立刻挪过去
+        for row in list(self.rows.values()):
+            s = row.session
+            same = ((path and (s.exe_path or "").lower() == path.lower())
+                    or (not path and s.process_name.lower() == name.lower()))
+            if not same or not s.pid:
+                continue
+            if device_id:
+                try:
+                    self.core.route_process(s.pid, device_id, self.flow)
+                except Exception:
+                    pass
+            row.apply_current_device(device_id)
+        self._mem_sig = None
+        self.refresh(full=True)
+        if not quiet:
+            self._flash_status(
+                f"{name} 改成 {dev_name}" if device_id else f"{name} 已取消记忆（跟随系统）")
+
+    def _selection_for(self, row) -> list[str]:
+        """右键某行：它不在选中集里就先单独选它，然后返回选中集。"""
+        key = getattr(row, "key", "")
+        if key and key not in self._sel:
+            self._sel = {key}
+            self._sel_anchor = key
+            self._apply_selection()
+        keys = self._selected_keys()
+        return keys or ([key] if key else [])
+
+    def _on_memory_menu(self, row, gpos):
+        """记忆行右键：删除 / 改记住的声卡（多选时作用于全部选中）。"""
+        keys = self._selection_for(row)
+        if not keys:
+            return
+        rules = self.store.all_rules()
+        cur = str(rules.get(keys[0], {}).get("device") or "") if len(keys) == 1 else ""
+        n = len(keys)
+        menu = QMenu(self)
+        act_del = menu.addAction(f"删除 {n} 条记忆" if n > 1 else "删除这条记忆")
+        act_del.setData("del")
+        sub = menu.addMenu("改记住的声卡" if n == 1 else f"改 {n} 条记忆的声卡")
+        act_follow = sub.addAction(("✓ " if not cur else "") + "跟随系统（不记忆）")
+        act_follow.setData("dev:")
+        for d in self.devices:
+            act = sub.addAction(("✓ " if n == 1 and d.id == cur else "") + d.short_name)
+            act.setData("dev:" + d.id)
+
+        picked = menu.exec(gpos)
+        if picked is None:
+            return
+        what = str(picked.data() or "")
+        if what == "del":
+            self._remove_memory_keys(keys)
+        elif what.startswith("dev:"):
+            new_dev = what[4:]
+            for i, k in enumerate(keys):
+                self._on_memory_device(k, new_dev, quiet=(i < len(keys) - 1))
+            if len(keys) > 1:
+                self._flash_status(f"已改 {n} 条记忆")
+
+    def _on_memory_remove(self, key: str):
+        self._remove_memory_keys([key], quiet=True)
+        self._flash_status("已删除这条记忆，该应用改为跟随系统")
+
+    def _remove_memory_keys(self, keys, quiet: bool = False):
+        rules = self.store.all_rules()
+        n = 0
+        for k in keys:
+            r = rules.get(k)
+            if r:
+                self.store.remove(str(r.get("name") or ""), str(r.get("path") or ""))
+                n += 1
+        self._sel.clear()
+        self._sel_anchor = None
+        self._apply_selection()
+        self._mem_sig = None
+        self.refresh(full=True)
+        if not quiet:
+            self._flash_status(f"已删除 {n} 条记忆，对应应用改为跟随系统")
+
+    def _on_fav_menu(self, row, gpos):
+        keys = self._selection_for(row)
+        if not keys:
+            return
+        n = len(keys)
+        menu = QMenu(self)
+        act = menu.addAction(f"取消收藏（{n} 个）" if n > 1 else "取消收藏")
+        act.setData("unfav")
+        picked = menu.exec(gpos)
+        if picked is None or str(picked.data() or "") != "unfav":
+            return
+        self._unfav_keys(keys)
+
+    def _on_hidden_menu(self, row, gpos):
+        keys = self._selection_for(row)
+        if not keys:
+            return
+        n = len(keys)
+        menu = QMenu(self)
+        act = menu.addAction(f"恢复（{n} 个）" if n > 1 else "恢复到列表")
+        act.setData("restore")
+        picked = menu.exec(gpos)
+        if picked is None or str(picked.data() or "") != "restore":
+            return
+        self._restore_keys(keys)
+
+    def _idle_fav_keys(self) -> list[str]:
+        """没在运行的收藏的 key 列表。"""
+        try:
+            sessions = self.core.sessions(self.flow)
+        except Exception:
+            sessions = []
+        live = {self.store.key(x.process_name, x.exe_path) for x in sessions}
+        return sorted(k for k in self.store.favorites() if k not in live)
+
+    def _unfav_all_idle(self):
+        keys = self._idle_fav_keys()
+        if not keys:
+            self._flash_status("没有未运行的收藏")
+            return
+        self._unfav_keys(keys)
+
+    def _unfav_keys(self, keys):
+        n = len(keys)
+        for k in keys:
+            self.store.remove_fav(k)
+        self._sel.clear()
+        self._sel_anchor = None
+        self._apply_selection()
+        self._fav_sig = None
+        self.refresh(full=True)
+        self._flash_status(f"已取消收藏 {n} 个应用" if n > 1 else "已取消收藏")
+
+    def _restore_keys(self, keys):
+        n = len(keys)
+        for k in keys:
+            self.store.unhide(k)
+        self._sel.clear()
+        self._sel_anchor = None
+        self._apply_selection()
+        self._hidden_sig = None
+        self.refresh(full=True)
+        self._flash_status(f"已恢复 {n} 个应用到列表" if n > 1 else "已恢复到应用列表")
+
+    def _on_delete_key(self):
+        """Delete 键：按当前页删除选中的条目。"""
+        keys = self._selected_keys()
+        if not keys:
+            return
+        if self.view_mode == 3:
+            self._remove_memory_keys(keys)
+        elif self.view_mode == 1:
+            self._unfav_keys(keys)
+        elif self.view_mode == 2:
+            self._restore_keys(keys)
+
+    def _restore_hidden(self, key: str):
+        self.store.unhide(key)
+        self._hidden_sig = None
+        self.refresh(full=True)
+        self._flash_status("已恢复到应用列表")
+
+    def _add_fav_selected(self, rows):
+        n = 0
+        for row in rows:
+            s = row.session
+            if not self.store.is_fav(s.process_name, s.exe_path):
+                self.store.toggle_fav(s.process_name, s.exe_path)
+                n += 1
+            row.set_favorite(True)
+        self._flash_status(f"已收藏 {n} 个应用" if n else "选中的应用都已收藏")
+        self._update_status()
+
+    def _unfav_selected(self, rows):
+        n = 0
+        for row in rows:
+            s = row.session
+            if self.store.is_fav(s.process_name, s.exe_path):
+                self.store.toggle_fav(s.process_name, s.exe_path)
+                n += 1
+            row.set_favorite(False)
+        self._sel.clear()
+        self._apply_selection()
+        self._flash_status(f"已取消收藏 {n} 个应用" if n else "选中的应用都没收藏")
+        if self.show_fav_only:
+            self.refresh(full=True)
+        else:
+            self._update_status()
+
     def reset_all(self):
         count = 0
         for row in self.rows.values():
@@ -735,10 +1307,24 @@ class MainWindow(QWidget):
         n_fav = self.store.fav_count()
         auto = "开" if self.store.settings.get("auto_apply", True) else "关"
         policy = "可用" if self.core.policy_available else "不可用（需要 Win10 1803+）"
+        n_hidden = len(self.store.hidden_items())
+        if self.view_mode == 2:
+            # 「已移除」页：条数按移除的应用算，不再按会话
+            head = f"{n_hidden} 个已移除"
+            self.count_label.setText(f"({n_hidden})")
+        elif self.view_mode == 1:
+            head = f"{n_fav} 个收藏"
+            self.count_label.setText(f"({n_fav})")
+        elif self.view_mode == 3:
+            head = f"{n_rules} 条记忆"
+            self.count_label.setText(f"({n_rules})")
+        else:
+            extra = f" · 已移除 {n_hidden}" if n_hidden else ""
+            head = f"{len(self.rows)} 个会话{extra}"
+            self.count_label.setText(f"({len(self.rows)})")
         self.status_label.setText(
-            f"{len(self.rows)} 个会话 · 收藏 {n_fav} · {n_rules} 条记忆规则 · "
+            f"{head} · 收藏 {n_fav} · {n_rules} 条记忆规则 · "
             f"自动套用：{auto} · 系统接口：{policy}")
-        self.count_label.setText(f"({len(self.rows)})")
 
     def _flash_status(self, text: str):
         self.status_label.setText(text)
