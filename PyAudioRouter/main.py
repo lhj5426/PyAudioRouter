@@ -456,17 +456,22 @@ class MainWindow(QWidget):
         self.show_fav_only = (idx == 1)
         self._sel.clear()
         self._sel_anchor = None
-        # 切换「全部 / 收藏」都取消声卡筛选：全部=所有应用，收藏=所有收藏的应用
+        # 切换任何页签都取消声卡筛选（卡片高亮也要跟着撤，卡片只在设备变化时重建）
         self.selected_device = None
+        self._sync_device_active()
         self.refresh(full=True)
 
-    def _on_device_clicked(self, device_id: str):
-        """点设备卡片：只看这块声卡上的应用，再点一次取消。"""
-        self.selected_device = None if self.selected_device == device_id else device_id
+    def _sync_device_active(self):
+        """把声卡卡片的高亮状态同步到 self.selected_device。"""
         for i in range(self.device_layout.count()):
             w = self.device_layout.itemAt(i).widget()
             if isinstance(w, DeviceCard):
                 w.set_active(w.device.id == self.selected_device)
+
+    def _on_device_clicked(self, device_id: str):
+        """点设备卡片：只看这块声卡上的应用，再点一次取消。"""
+        self.selected_device = None if self.selected_device == device_id else device_id
+        self._sync_device_active()
         self.refresh(full=True)
 
     def _update_section_label(self):
