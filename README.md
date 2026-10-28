@@ -1,5 +1,8 @@
 # 淫书馆录制GALGAME多开专用多声卡多窗口设置工具
 
+<img width="1851" height="962" alt="image" src="https://github.com/user-attachments/assets/69f0a27e-b25e-49b0-8818-78ac15fce825" />
+
+
 # 多声卡多窗口独立设置用来替代10多年没更新的CheVolume 
 
 
