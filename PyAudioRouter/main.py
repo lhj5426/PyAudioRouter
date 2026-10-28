@@ -21,8 +21,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QFrame, QGraphicsDrop
 import audio_core as ac
 import theme
 from store import Store
-from ui_widgets import (DeviceCard, EmptyHint, FavRow, HiddenRow, ListGroupHeader,
-                        MemoryRow, SessionRow, TitleBar)
+from ui_widgets import DeviceCard, EmptyHint, ListGroupHeader, SessionRow, TitleBar
 
 
 APP_TITLE = "多声卡窗口管理"
@@ -56,7 +55,10 @@ class MainWindow(QWidget):
         self._hidden_sig: tuple | None = None
         self._mem_sig: tuple | None = None
         self._fav_sig: tuple | None = None
-        self._fav_open = {"run": True, "idle": True}   # 收藏页两个分组是否展开
+        self._live_cache: dict[str, ac.Session] = {}
+        # 各页签「运行中 / 未运行」分组是否展开
+        self._group_open: dict[tuple[str, str], bool] = {
+            (pg, g): True for pg in ("fav", "hid", "mem") for g in ("run", "idle")}
         self.selected_device: str | None = None
         self._route_ts: dict[int, float] = {}
         self._first_seen: dict[int, float] = {}
@@ -511,6 +513,8 @@ class MainWindow(QWidget):
             if isinstance(w, DeviceCard):
                 w.set_level(_db_level(self.core.device_peak(w.device.id)))
         for row in self.rows.values():
+            if row.session is None:
+                continue
             row.set_level(_db_level(row.session.peak()))
 
     def _effective_device(self, s: ac.Session) -> str:
@@ -555,10 +559,17 @@ class MainWindow(QWidget):
     def _update_device_counts(self):
         """统计每块声卡上当前有几个应用在发声，显示在卡片上。"""
         counts: dict[str, int] = {}
-        for row in self.rows.values():
-            d = row.session.device_id
-            if d:
-                counts[d] = counts.get(d, 0) + 1
+        if self._list_mode:
+            sessions = self._live_cache.values()
+            for x in sessions:
+                d = x.device_id or ""
+                if d:
+                    counts[d] = counts.get(d, 0) + 1
+        else:
+            for row in self.rows.values():
+                d = row.session.device_id if row.session is not None else ""
+                if d:
+                    counts[d] = counts.get(d, 0) + 1
         for i in range(self.device_layout.count()):
             w = self.device_layout.itemAt(i).widget()
             if isinstance(w, DeviceCard):
@@ -645,31 +656,14 @@ class MainWindow(QWidget):
             self._empty_text = None
 
     def _create_row(self, key: str, s: ac.Session) -> SessionRow | None:
-        if hasattr(self, "_empty_hint"):
-            self.session_layout.removeWidget(self._empty_hint)
-            self._empty_hint.deleteLater()
-            del self._empty_hint
         try:
-            row = SessionRow(s, self.devices, self.dark,
-                             favorite=self.store.is_fav(s.process_name, s.exe_path))
+            row = self._add_app_row(key, s, s.process_name, s.exe_path, "",
+                                    "", len(self.rows) + 1)
         except Exception:
             traceback.print_exc()
             return None
-        row.device_changed.connect(self._on_device_changed)
-        row.volume_changed.connect(self._on_volume_changed)
-        row.mute_toggled.connect(self._on_mute_toggled)
-        row.fav_toggled.connect(self._on_fav_toggled)
-        row.clicked.connect(self._on_row_clicked)
-        row.menu_requested.connect(self._on_row_menu)
-        row.key = key
-        self.session_layout.insertWidget(self.session_layout.count() - 1, row)
-        self.rows[key] = row
-
-        # 下拉：有记住的选择就显示它，否则显示会话实际所在设备
-        saved = self.store.get(s.process_name, self.flow, s.exe_path)
-        row.apply_current_device(self._effective_device(s))
-
         # 自动套用记忆规则
+        saved = self.store.get(s.process_name, self.flow, s.exe_path)
         if (self.store.settings.get("auto_apply", True) and saved
                 and s.pid and key not in self._applied):
             # 会话当前不在目标设备上才需要套用
@@ -696,70 +690,151 @@ class MainWindow(QWidget):
             return False
 
     # -------------------------------------------------------------- events
-    def _on_device_changed(self, session: ac.Session, device_id: str):
-        # 只影响「同一 exe 路径」的行：复制多份的游戏各自独立
-        targets = []
-        for row in self.rows.values():
-            s = row.session
-            if session.exe_path:
-                same = bool(s.exe_path) and s.exe_path.lower() == session.exe_path.lower()
-            else:
-                same = s.process_name.lower() == session.process_name.lower()
-            if same:
-                targets.append(row)
+    @staticmethod
+    def _same_app(a: ac.Session, b: ac.Session) -> bool:
+        if a.exe_path and b.exe_path:
+            return a.exe_path.lower() == b.exe_path.lower()
+        return (a.process_name or "").lower() == (b.process_name or "").lower()
 
-        ok = True
-        for row in targets:
-            if not self._route(row.session, device_id):
-                ok = False
+    def _paths_of(self, key: str, session: ac.Session | None) -> tuple[str, str]:
+        if session is not None:
+            return session.process_name, session.exe_path
+        return self._split_key(key)
 
-        if not ok:
-            # 失败：下拉回退到系统当前实际值，不写入记忆规则
-            for row in targets:
-                try:
-                    row.apply_current_device(self.core.get_route(row.session.pid, self.flow))
-                except Exception:
-                    row.apply_current_device("")
-            self._update_status()
+    def _rule_device(self, key: str) -> str:
+        return str((self.store.all_rules().get(key) or {}).get("device") or "")
+
+    def _on_device_changed(self, key: str, device_id: str):
+        """声卡下拉改变：能路由就立刻切，同时写进记忆；没运行的只写记忆。"""
+        row = self.rows.get(key)
+        if row is None:
             return
-
+        name, path = self._paths_of(key, row.session)
         dev_name = next((d.short_name for d in self.devices if d.id == device_id), "")
-        self.store.set(session.process_name, device_id, self.flow,
-                       session.exe_path, dev_name)
-        for row in targets:
-            self._route_ts[row.session.pid] = time.monotonic()
-        name = device_id and next((d.short_name for d in self.devices if d.id == device_id), "")
+        s = row.session
+        if s is not None:
+            targets = [r for r in self.rows.values()
+                       if r.session is not None and self._same_app(r.session, s)]
+            ok = True
+            for r in targets:
+                if not self._route(r.session, device_id):
+                    ok = False
+            if not ok:
+                for r in targets:
+                    try:
+                        r.apply_current_device(self.core.get_route(r.session.pid, self.flow))
+                    except Exception:
+                        r.apply_current_device("")
+                self._update_status()
+                return
+            for r in targets:
+                self._route_ts[r.session.pid] = time.monotonic()
+                r.apply_current_device(device_id)
+        self.store.set(name, device_id, self.flow, path, dev_name)
+        self._fav_sig = self._hidden_sig = self._mem_sig = None
         if device_id:
-            self._flash_status(f"{session.process_name} → {name}（已记住）")
+            self._flash_status(f"{name} → {dev_name}（已记住）")
         else:
-            self._flash_status(f"{session.process_name} 已恢复跟随系统")
+            self._flash_status(f"{name} 已恢复跟随系统")
         self._update_status()
 
-    def _on_volume_changed(self, session: ac.Session, value: float):
+    def _on_volume_changed(self, key: str, value: float):
+        row = self.rows.get(key)
+        s = row.session if row is not None else None
+        if s is None:
+            return
         try:
-            self.core.set_session_volume(session, value)
-            session.volume = value
+            self.core.set_session_volume(s, value)
+            s.volume = value
         except Exception:
             pass
 
-    def _on_mute_toggled(self, session: ac.Session, muted: bool):
+    def _on_mute_toggled(self, key: str, muted: bool):
+        row = self.rows.get(key)
+        s = row.session if row is not None else None
+        if s is None:
+            return
         try:
-            self.core.set_session_mute(session, muted)
-            session.muted = muted
+            self.core.set_session_mute(s, muted)
+            s.muted = muted
         except Exception:
             pass
 
-    def _on_fav_toggled(self, session: ac.Session):
-        on = self.store.toggle_fav(session.process_name, session.exe_path)
-        path = (session.exe_path or "").lower()
-        for row in self.rows.values():
-            if path and (row.session.exe_path or "").lower() == path:
-                row.set_favorite(on)
-        self._flash_status(f"已收藏 {session.title}" if on else f"已取消收藏 {session.title}")
-        if self.show_fav_only and not on:
+    def _on_fav_toggled(self, key: str, on: bool):
+        row = self.rows.get(key)
+        if row is None:
+            return
+        name, path = self._paths_of(key, row.session)
+        self.store.set_fav(name, path, on)
+        for r in self.rows.values():
+            if r is row:
+                continue
+            rn, rp = self._paths_of(r.key, r.session)
+            if path and rp and rp.lower() == path.lower():
+                r.set_favorite(on)
+            elif not path and rn.lower() == name.lower():
+                r.set_favorite(on)
+        self._fav_sig = None
+        if self.view_mode == 1 and not on:
             self.refresh(full=True)
         else:
+            self._flash_status(f"已收藏 {name}" if on else f"已取消收藏 {name}")
             self._update_status()
+
+    def _on_row_action(self, key: str):
+        """行尾动作按钮：按当前页签决定是取消收藏 / 恢复 / 删除记忆。"""
+        if self.view_mode == 1:
+            self._unfav_keys([key])
+        elif self.view_mode == 2:
+            self._restore_keys([key])
+        elif self.view_mode == 3:
+            self._remove_memory_keys([key])
+
+    def _live_map(self) -> dict[str, ac.Session]:
+        try:
+            sessions = self.core.sessions(self.flow)
+        except Exception:
+            return {}
+        live: dict[str, ac.Session] = {}
+        for x in sessions:
+            live.setdefault(self.store.key(x.process_name, x.exe_path), x)
+        return live
+
+    def _device_ok(self, session, fallback: str = "") -> bool:
+        """点声卡卡片后的过滤：在运行的按实际所在声卡，没运行的按记住的声卡。"""
+        if not self.selected_device:
+            return True
+        dev = session.device_id if session is not None else fallback
+        return (dev or "") == self.selected_device
+
+    def _add_app_row(self, key: str, session, name: str, path: str,
+                     device_id: str, extra_text: str, no: int):
+        row = SessionRow(session, self.devices, self.dark,
+                         favorite=self.store.is_fav(name, path),
+                         no=no, extra_text=extra_text,
+                         name=name, path=path, device_id=device_id)
+        row.key = key
+        row.device_changed.connect(self._on_device_changed)
+        row.volume_changed.connect(self._on_volume_changed)
+        row.mute_toggled.connect(self._on_mute_toggled)
+        row.fav_toggled.connect(self._on_fav_toggled)
+        row.action.connect(self._on_row_action)
+        row.clicked.connect(self._on_row_clicked)
+        menu_handler = {0: self._on_row_menu, 1: self._on_fav_menu,
+                        2: self._on_hidden_menu}.get(self.view_mode, self._on_memory_menu)
+        row.menu_requested.connect(menu_handler)
+        self.session_layout.insertWidget(self.session_layout.count() - 1, row)
+        self.rows[key] = row
+        if session is not None:
+            row.apply_current_device(self._effective_device(session))
+            row.update_volume(session.volume, session.muted)
+        return row
+
+    def _show_empty(self, text: str, tag: str):
+        hint = EmptyHint(text)
+        self.session_layout.insertWidget(0, hint)
+        self._empty_hint = hint
+        self._empty_text = tag
 
     # ---------------------------------------------------- 选择与右键菜单
     def _row_keys_in_order(self) -> list[str]:
@@ -935,7 +1010,7 @@ class MainWindow(QWidget):
             self.store.remove(s.process_name, s.exe_path)
             if self.store.is_fav(s.process_name, s.exe_path):
                 self.store.toggle_fav(s.process_name, s.exe_path)
-            self.store.hide(s.process_name, s.exe_path)
+            self.store.hide(s.process_name, s.exe_path, s.device_id or "")
             self._applied.discard(key)
             self._sel.discard(key)
             if s.pid:
@@ -962,29 +1037,80 @@ class MainWindow(QWidget):
             if hasattr(self, attr):
                 delattr(self, attr)
 
+    def _group_sig(self, page: str) -> tuple:
+        return (self._group_open.get((page, "run"), True),
+                self._group_open.get((page, "idle"), True))
+
+    def _on_group_toggle(self, page: str, gkey: str):
+        k = (page, gkey)
+        self._group_open[k] = not self._group_open.get(k, True)
+        if page == "fav":
+            self._fav_sig = None
+        elif page == "hid":
+            self._hidden_sig = None
+        else:
+            self._mem_sig = None
+        self.refresh(full=True)
+
+    def _emit_grouped(self, page: str, entries: list[tuple], extra_text: str,
+                      idle_action_text: str = "", idle_action=None) -> int:
+        """按「运行中 / 未运行」分组插入行，返回插进去的行数。
+
+        entries: [(key, session, name, path, device_id, 是否运行中)]
+        """
+        running = [e for e in entries if e[5]]
+        idle = [e for e in entries if not e[5]]
+        no = 0
+        shown = 0
+        for gkey, title, items in (("run", "运行中", running), ("idle", "未运行", idle)):
+            if not items:
+                continue
+            opened = bool(self._group_open.get((page, gkey), True))
+            action_text = idle_action_text if (gkey == "idle" and idle_action_text) else ""
+            head = ListGroupHeader(title, len(items), opened, gkey, self.dark,
+                                   action_text=action_text)
+            head.clicked.connect(lambda g, p=page: self._on_group_toggle(p, g))
+            if action_text and idle_action is not None:
+                keys = tuple(e[0] for e in items)
+                head.action.connect(lambda _g, _k=keys: idle_action(list(_k)))
+            self.session_layout.insertWidget(self.session_layout.count() - 1, head)
+            shown += 1
+            if not opened:
+                no += len(items)          # 折叠时也占号，展开后序号不变
+                continue
+            for key, sess, name, path, dev, _run in items:
+                no += 1
+                shown += 1
+                self._add_app_row(key, sess, name, path, dev, extra_text, no)
+        return shown
+
     def _show_hidden_rows(self):
         items = self.store.hidden_items()
-        sig = tuple(sorted(items))
+        live = self._live_map()
+        sig = (tuple(sorted((k, str(v.get("device") or "")) for k, v in items.items())),
+               tuple(sorted(live)), self.selected_device, self._group_sig("hid"))
         if self._list_mode == 2 and sig == self._hidden_sig:
             return
+        self._live_cache = live
         self._clear_sessions()
         self._list_mode = 2
         self._hidden_sig = sig
         if not items:
-            hint = EmptyHint("还没有移除任何应用\n在应用行上右键 → 移除应用")
-            self.session_layout.insertWidget(0, hint)
-            self._empty_hint = hint
-            self._empty_text = "hidden"
+            self._show_empty("还没有移除任何应用\n在应用行上右键 → 移除应用", "hidden")
             return
-        ordered = sorted(items.items(),
-                         key=lambda kv: (str(kv[1].get("name") or "").lower(), kv[0]))
-        for i, (key, info) in enumerate(ordered):
-            row = HiddenRow(key, str(info.get("name") or key), str(info.get("path") or ""),
-                            self.dark, i + 1)
-            row.restore.connect(self._restore_hidden)
-            row.clicked.connect(self._on_row_clicked)
-            row.menu_requested.connect(self._on_hidden_menu)
-            self.session_layout.insertWidget(self.session_layout.count() - 1, row)
+        entries = []
+        for key, info in sorted(items.items(),
+                                key=lambda kv: (str(kv[1].get("name") or "").lower(), kv[0])):
+            s = live.get(key)
+            dev = str(info.get("device") or "")
+            if not self._device_ok(s, dev):
+                continue
+            entries.append((key, s, str(info.get("name") or key),
+                            str(info.get("path") or ""), dev, s is not None))
+        if not entries:
+            self._show_empty("这块声卡上没有已移除的应用", "hidden-filter")
+            return
+        self._emit_grouped("hid", entries, "恢复")
 
     @staticmethod
     def _split_key(key: str) -> tuple[str, str]:
@@ -997,127 +1123,66 @@ class MainWindow(QWidget):
         return k, ""
 
     def _show_fav_rows(self):
-        """「收藏」页：所有收藏都列出来（含没在运行的），按运行中/未运行分组，可折叠。"""
+        """「收藏」页：运行中的带完整控制，未运行的置灰但可预选声卡。"""
         favs = self.store.favorites()
-        try:
-            sessions = self.core.sessions(self.flow)
-        except Exception:
-            sessions = []
-        live: dict[str, ac.Session] = {}
-        for x in sessions:
-            live.setdefault(self.store.key(x.process_name, x.exe_path), x)
-        sig = (frozenset(favs), frozenset(live),
-               self._fav_open["run"], self._fav_open["idle"])
+        live = self._live_map()
+        sig = (frozenset(favs), frozenset(live), self.selected_device,
+               self._group_sig("fav"))
         if self._list_mode == 1 and sig == self._fav_sig:
             return
+        self._live_cache = live
         self._clear_sessions()
         self._list_mode = 1
         self._fav_sig = sig
         if not favs:
-            hint = EmptyHint("还没有收藏\n在应用行右边点 ☆ 就能收藏")
-            self.session_layout.insertWidget(0, hint)
-            self._empty_hint = hint
-            self._empty_text = "fav"
+            self._show_empty("还没有收藏\n在应用行右边点 ☆ 就能收藏", "fav")
             return
-        running = sorted(k for k in favs if k in live)
-        idle = sorted(k for k in favs if k not in live)
-        no = 0
-        for gkey, title, keys in (("run", "运行中", running), ("idle", "未运行", idle)):
-            if not keys:
+        entries = []
+        for k in sorted(favs):
+            s = live.get(k)
+            if not self._device_ok(s, self._rule_device(k)):
                 continue
-            opened = bool(self._fav_open.get(gkey, True))
-            head = ListGroupHeader(
-                title, len(keys), opened, gkey, self.dark,
-                action_text="取消全部收藏" if gkey == "idle" else "")
-            head.clicked.connect(self._on_fav_group)
-            head.action.connect(lambda _g, _k=tuple(keys): self._unfav_keys(list(_k)))
-            self.session_layout.insertWidget(self.session_layout.count() - 1, head)
-            if not opened:
-                no += len(keys)          # 折叠时也占号，展开后序号不变
-                continue
-            for key in keys:
-                no += 1
-                s = live.get(key)
-                name, path = self._split_key(key)
-                row = FavRow(key,
-                             s.process_name if s else name,
-                             s.exe_path if s else path,
-                             s is not None, self.dark, no)
-                row.unfav.connect(self._on_fav_row_remove)
-                row.clicked.connect(self._on_row_clicked)
-                row.menu_requested.connect(self._on_fav_menu)
-                self.session_layout.insertWidget(self.session_layout.count() - 1, row)
-
-    def _on_fav_group(self, gkey: str):
-        self._fav_open[gkey] = not self._fav_open.get(gkey, True)
-        self._fav_sig = None
-        self.refresh(full=True)
-
-    def _on_fav_row_remove(self, key: str):
-        name, path = self._split_key(key)
-        self.store.remove_fav(key)
-        for row in list(self.rows.values()):
-            s = row.session
-            if self.store.key(s.process_name, s.exe_path) == str(key).lower():
-                row.set_favorite(False)
-        self._fav_sig = None
-        self.refresh(full=True)
-        self._flash_status(f"已取消收藏 {name}")
+            name, path = self._split_key(k)
+            entries.append((k, s,
+                            s.process_name if s else name,
+                            s.exe_path if s else path,
+                            "" if s else self._rule_device(k),
+                            s is not None))
+        if not entries:
+            self._show_empty("这块声卡上没有收藏的应用", "fav-filter")
+            return
+        self._emit_grouped("fav", entries, "移出收藏", "取消全部收藏",
+                           lambda keys: self._unfav_keys(keys))
 
     def _show_memory_rows(self):
-        """「记忆」页：列出所有「应用 → 声卡」的记忆，可改可删。"""
+        """「记忆」页：记忆里的应用，运行中的带完整控制，未运行的置灰。"""
         rules = self.store.all_rules()
+        live = self._live_map()
         sig = (tuple(sorted((k, str(v.get("device") or "")) for k, v in rules.items())),
-               tuple(d.id for d in self.devices))
+               tuple(sorted(live)), tuple(d.id for d in self.devices),
+               self.selected_device, self._group_sig("mem"))
         if self._list_mode == 3 and sig == self._mem_sig:
             return
+        self._live_cache = live
         self._clear_sessions()
         self._list_mode = 3
         self._mem_sig = sig
         if not rules:
-            hint = EmptyHint("还没有记忆\n在应用行的下拉里选一块声卡，就会记住它")
-            self.session_layout.insertWidget(0, hint)
-            self._empty_hint = hint
-            self._empty_text = "memory"
+            self._show_empty("还没有记忆\n在应用行的下拉里选一块声卡，就会记住它", "memory")
             return
-        ordered = sorted(rules.items(),
-                         key=lambda kv: (str(kv[1].get("name") or "").lower(), kv[0]))
-        for i, (key, r) in enumerate(ordered):
-            row = MemoryRow(key, str(r.get("name") or key), str(r.get("path") or ""),
-                            str(r.get("device") or ""), self.devices, self.dark, i + 1)
-            row.device_changed.connect(self._on_memory_device)
-            row.removed.connect(self._on_memory_remove)
-            row.clicked.connect(self._on_row_clicked)
-            row.menu_requested.connect(self._on_memory_menu)
-            self.session_layout.insertWidget(self.session_layout.count() - 1, row)
-
-    def _on_memory_device(self, key: str, device_id: str, quiet: bool = False):
-        """在「记忆」页里改某条记忆记住的声卡。"""
-        r = self.store.all_rules().get(key)
-        if not r:
-            return
-        name = str(r.get("name") or "")
-        path = str(r.get("path") or "")
-        dev_name = next((d.short_name for d in self.devices if d.id == device_id), "")
-        self.store.set(name, device_id, self.flow, path, dev_name)
-        # 应用正在播放就立刻挪过去
-        for row in list(self.rows.values()):
-            s = row.session
-            same = ((path and (s.exe_path or "").lower() == path.lower())
-                    or (not path and s.process_name.lower() == name.lower()))
-            if not same or not s.pid:
+        entries = []
+        for key, r in sorted(rules.items(),
+                             key=lambda kv: (str(kv[1].get("name") or "").lower(), kv[0])):
+            s = live.get(key)
+            dev = str(r.get("device") or "")
+            if not self._device_ok(s, dev):
                 continue
-            if device_id:
-                try:
-                    self.core.route_process(s.pid, device_id, self.flow)
-                except Exception:
-                    pass
-            row.apply_current_device(device_id)
-        self._mem_sig = None
-        self.refresh(full=True)
-        if not quiet:
-            self._flash_status(
-                f"{name} 改成 {dev_name}" if device_id else f"{name} 已取消记忆（跟随系统）")
+            entries.append((key, s, str(r.get("name") or key),
+                            str(r.get("path") or ""), dev, s is not None))
+        if not entries:
+            self._show_empty("这块声卡上没有记忆的应用", "memory-filter")
+            return
+        self._emit_grouped("mem", entries, "删除记忆")
 
     def _selection_for(self, row) -> list[str]:
         """右键某行：它不在选中集里就先单独选它，然后返回选中集。"""
@@ -1155,14 +1220,10 @@ class MainWindow(QWidget):
             self._remove_memory_keys(keys)
         elif what.startswith("dev:"):
             new_dev = what[4:]
-            for i, k in enumerate(keys):
-                self._on_memory_device(k, new_dev, quiet=(i < len(keys) - 1))
+            for k in keys:
+                self._on_device_changed(k, new_dev)
             if len(keys) > 1:
                 self._flash_status(f"已改 {n} 条记忆")
-
-    def _on_memory_remove(self, key: str):
-        self._remove_memory_keys([key], quiet=True)
-        self._flash_status("已删除这条记忆，该应用改为跟随系统")
 
     def _remove_memory_keys(self, keys, quiet: bool = False):
         rules = self.store.all_rules()
@@ -1255,12 +1316,6 @@ class MainWindow(QWidget):
             self._unfav_keys(keys)
         elif self.view_mode == 2:
             self._restore_keys(keys)
-
-    def _restore_hidden(self, key: str):
-        self.store.unhide(key)
-        self._hidden_sig = None
-        self.refresh(full=True)
-        self._flash_status("已恢复到应用列表")
 
     def _add_fav_selected(self, rows):
         n = 0

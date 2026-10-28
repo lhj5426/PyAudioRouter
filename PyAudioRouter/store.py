@@ -230,13 +230,24 @@ class Store:
         with self._lock:
             return bool(k) and k in (self.settings.get("hidden") or {})
 
-    def hide(self, process_name: str, exe_path: str = ""):
+    def set_fav(self, process_name: str, exe_path: str = "", on: bool = True):
+        k = self.key(process_name, exe_path)
+        if not k:
+            return
+        with self._lock:
+            if on:
+                self._favorites.add(k)
+            else:
+                self._favorites.discard(k)
+        self.save()
+
+    def hide(self, process_name: str, exe_path: str = "", device: str = ""):
         k = self.key(process_name, exe_path)
         if not k:
             return
         with self._lock:
             h = dict(self.settings.get("hidden") or {})
-            h[k] = {"name": process_name or k, "path": exe_path or ""}
+            h[k] = {"name": process_name or k, "path": exe_path or "", "device": device or ""}
             self.settings["hidden"] = h
         self.save()
 
