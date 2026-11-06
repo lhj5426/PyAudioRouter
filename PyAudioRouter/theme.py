@@ -62,7 +62,7 @@ QWidget#Root {{
 }}
 QFrame#Shell {{
     background: {c['bg']};
-    border: 1px solid {c['border']};
+    border: 2px solid {c['accent']};
     border-radius: 14px;
 }}
 QWidget#Body {{
@@ -131,6 +131,26 @@ QPushButton#SegBtn:hover {{
 QPushButton#SegBtn:checked {{
     background: {c['accent']};
     border-color: {c['accent']};
+    color: #FFFFFF;
+    font-weight: 600;
+}}
+
+/* ---------- 按声卡分组按钮（点亮橙色） ---------- */
+QPushButton#GroupBtn {{
+    border: 1px solid {c['border']};
+    background: {c['card']};
+    color: {c['sub']};
+    padding: 3px 12px;
+    border-radius: 7px;
+    font-size: 12px;
+}}
+QPushButton#GroupBtn:hover {{
+    background: {c['hover']};
+    color: {c['text']};
+}}
+QPushButton#GroupBtn:checked {{
+    background: {c['warn']};
+    border-color: {c['warn']};
     color: #FFFFFF;
     font-weight: 600;
 }}
@@ -210,6 +230,34 @@ QFrame#SessionRow {{
 QFrame#SessionRow:hover {{
     border-color: {c['border_strong']};
 }}
+QFrame#SessionRow[cmp="card"] {{
+    border-radius: 9px;
+}}
+QFrame#SessionRow[cmp="card"] QLabel#AppName {{
+    font-size: 12px;
+}}
+QFrame#SessionRow[cmp="card"] QPushButton#IconBtn {{
+    min-width: 22px;
+    max-width: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    font-size: 11px;
+    border-radius: 6px;
+}}
+QFrame#SessionRow[cmp="card"] QPushButton#FavBtn {{
+    min-width: 22px;
+    max-width: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    font-size: 15px;
+}}
+QFrame#SessionRow[cmp="card"] QComboBox {{
+    font-size: 11px;
+    padding: 1px 6px;
+}}
+QFrame#SessionRow[new="true"] {{
+    border: 1px solid {c['warn']};
+}}
 QFrame#SessionRow[sel="true"] {{
     background: {c['accent_soft']};
     border: 1px solid {c['accent']};
@@ -222,6 +270,10 @@ QLabel#AppName {{
 QLabel#AppSub {{
     font-size: 12px;
     color: {c['text']};
+}}
+QLabel#AppTime {{
+    font-size: 11px;
+    color: {c['sub']};
 }}
 QLabel#VolValue {{
     font-size: 11px;
@@ -240,6 +292,11 @@ QLabel#GroupTitle {{
     font-size: 12px;
     font-weight: 600;
     color: {c['sub']};
+}}
+QLabel#GroupTitle2 {{
+    font-size: 11px;
+    font-weight: 600;
+    color: {c['faint']};
 }}
 
 /* ---------- 下拉框 ---------- */

@@ -30,6 +30,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # 多久核对一次系统默认设备（毫秒）。只改这一行。
 jian_ge_haomiao = 3000
 
+# 新出现的应用行描边保持几秒。只改这一行。
+xin_chuxian_miao = 8.0
+
 # 电平：条长和数值都用线性百分比（0~100%），跟常见的混音器读数一致
 def _db_level(peak: float) -> float:
     """峰值 -> 电平条位置（线性 0~1），数值按这个换算成百分比。"""
@@ -59,6 +62,14 @@ class MainWindow(QWidget):
         # 各页签「运行中 / 未运行」分组是否展开
         self._group_open: dict[tuple[str, str], bool] = {
             (pg, g): True for pg in ("fav", "hid", "mem") for g in ("run", "idle")}
+        # 按声卡分组：点亮后列表按「声卡」再分一层（点按钮切换，状态存进配置）
+        self.an_shengka_fenzu = bool(self.store.settings.get("an_shengka_fenzu", False))
+        self.jian_jie_moshi = bool(self.store.settings.get("jian_jie_moshi", False))
+        self._grp_heads: dict[str, object] = {}   # 「全部」页的声卡分组标题缓存
+        self._card_hosts: dict[tuple, object] = {}  # 卡片模式：一行卡片的外框（复用）
+        self._card_lay = None        # 管理页卡片模式正在拼的那一行
+        self._card_n = 0
+        self._card_cols_now = 0
         self.selected_device: str | None = None
         self._route_ts: dict[int, float] = {}
         self._first_seen: dict[int, float] = {}
@@ -72,7 +83,8 @@ class MainWindow(QWidget):
         self.setWindowIcon(theme.app_icon(64))
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window
                             | Qt.WindowMinimizeButtonHint | Qt.WindowSystemMenuHint)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        # OBS 采集友好：不用半透明背景（layered 窗口抓不到画面）
+        # self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.resize(940, 660)
         self.setMinimumSize(760, 520)
 
@@ -80,6 +92,7 @@ class MainWindow(QWidget):
         self.apply_theme()
         self._restore_geometry()
         self.refresh(full=True)
+        self._apply_round_region()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self.refresh(full=False))
@@ -115,16 +128,11 @@ class MainWindow(QWidget):
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
+        root.setContentsMargins(4, 4, 4, 4)
         root.setSpacing(0)
 
         self.shell = QFrame()
         self.shell.setObjectName("Shell")
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(36)
-        shadow.setOffset(0, 8)
-        shadow.setColor(QColor(16, 24, 40, 60))
-        self.shell.setGraphicsEffect(shadow)
         root.addWidget(self.shell)
 
         shell_lay = QVBoxLayout(self.shell)
@@ -142,33 +150,19 @@ class MainWindow(QWidget):
         shell_lay.addWidget(body, 1)
 
         lay = QVBoxLayout(body)
-        lay.setContentsMargins(18, 6, 18, 8)
-        lay.setSpacing(10)
-
-        # ---- 顶部：输出设备 + 刷新
-        top = QHBoxLayout()
-        top.setSpacing(8)
-        dev_title = QLabel("声卡")
-        dev_title.setObjectName("SectionTitle")
-        top.addWidget(dev_title)
-        top.addStretch(1)
-        self.btn_refresh = QPushButton("↻  刷新")
-        self.btn_refresh.setObjectName("GhostBtn")
-        self.btn_refresh.setCursor(Qt.PointingHandCursor)
-        self.btn_refresh.clicked.connect(self._force_refresh)
-        top.addWidget(self.btn_refresh)
-        lay.addLayout(top)
+        lay.setContentsMargins(18, 4, 18, 6)
+        lay.setSpacing(8)
 
         # ---- 设备区
         self.device_scroll = QScrollArea()
         self.device_scroll.setWidgetResizable(False)
-        self.device_scroll.setFixedHeight(122)
+        self.device_scroll.setFixedHeight(108)
         self.device_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.device_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.device_host = QWidget()
         self.device_host.setObjectName("Body")
         self.device_layout = QHBoxLayout(self.device_host)
-        self.device_layout.setContentsMargins(0, 2, 0, 6)
+        self.device_layout.setContentsMargins(0, 2, 0, 0)
         self.device_layout.setSpacing(10)
         self.device_layout.addStretch(1)
         self.device_scroll.setWidget(self.device_host)
@@ -205,7 +199,50 @@ class MainWindow(QWidget):
         head.addWidget(self.btn_hidden)
         head.addWidget(self.btn_mem)
 
+        self.btn_group = QPushButton("按声卡分组")
+        self.btn_group.setObjectName("GroupBtn")
+        self.btn_group.setCheckable(True)
+        self.btn_group.setCursor(Qt.PointingHandCursor)
+        self.btn_group.setToolTip("点亮后：全部按声卡分组；收藏/已移除/记忆 在运行中、未运行下再按声卡分组")
+        self.btn_group.setChecked(self.an_shengka_fenzu)
+        self.btn_group.toggled.connect(self._on_fenzu_toggled)
+        head.addWidget(self.btn_group)
+
+        self.btn_compact = QPushButton("精简模式")
+        self.btn_compact.setObjectName("GroupBtn")
+        self.btn_compact.setCheckable(True)
+        self.btn_compact.setCursor(Qt.PointingHandCursor)
+        self.btn_compact.setToolTip("点亮后每个应用变成一张小卡片，一行并排好几张；路径和启动时间收进悬停提示")
+        self.btn_compact.setChecked(self.jian_jie_moshi)
+        self.btn_compact.toggled.connect(self._on_compact_toggled)
+        head.addWidget(self.btn_compact)
+
         head.addStretch(1)
+        self.btn_unfav_idle = QPushButton("取消全部未运行收藏")
+        self.btn_unfav_idle.setObjectName("GhostBtn")
+        self.btn_unfav_idle.setCursor(Qt.PointingHandCursor)
+        self.btn_unfav_idle.setToolTip("只取消没在运行的那些收藏；正在播放的一个不动")
+        self.btn_unfav_idle.clicked.connect(lambda: self._unfav_all_idle())
+        self.btn_unfav_idle.setVisible(False)
+        head.addWidget(self.btn_unfav_idle)
+
+        self.btn_unfav = QPushButton("取消全部收藏")
+        self.btn_unfav.setObjectName("GhostBtn")
+        self.btn_unfav.setCursor(Qt.PointingHandCursor)
+        self.btn_unfav.setToolTip("取消全部收藏，正在运行的和没在运行的都会取消")
+        self.btn_unfav.clicked.connect(lambda: self._unfav_all())
+        self.btn_unfav.setVisible(False)
+        head.addWidget(self.btn_unfav)
+        self.btn_unfav.setVisible(self.view_mode == 1)
+
+        self.btn_mem_clear = QPushButton("清空全部未运行记忆")
+        self.btn_mem_clear.setObjectName("GhostBtn")
+        self.btn_mem_clear.setCursor(Qt.PointingHandCursor)
+        self.btn_mem_clear.setToolTip("把没在运行的应用的记忆一次性删掉；正在运行的一个不动")
+        self.btn_mem_clear.clicked.connect(lambda: self._remove_all_idle_memory())
+        self.btn_mem_clear.setVisible(False)
+        head.addWidget(self.btn_mem_clear)
+
         self.btn_clear = QPushButton("全部恢复默认")
         self.btn_clear.setObjectName("GhostBtn")
         self.btn_clear.setCursor(Qt.PointingHandCursor)
@@ -240,11 +277,29 @@ class MainWindow(QWidget):
         self.grip.setFixedSize(16, 16)
         self.grip.setStyleSheet("background: transparent;")
 
+    def _apply_round_region(self):
+        """Win32 把窗口裁成圆角：不用半透明，OBS 也能采到画面。
+
+        圆角直径比 QSS 的 border-radius 大几像素，且边框离窗口边缘有 4 像素，
+        免得蓝色描边在圆角处被硬裁剪啃掉一截。
+        """
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            rgn = ctypes.windll.gdi32.CreateRoundRectRgn(
+                0, 0, max(1, self.width() + 1), max(1, self.height() + 1), 36, 36)
+            ctypes.windll.user32.SetWindowRgn(hwnd, rgn, True)
+        except Exception:
+            pass
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self.grip.move(self.shell.width() - 20, self.shell.height() - 20)
+        self.grip.move(self.shell.width() - 16, self.shell.height() - 16)
+        self._apply_round_region()
         if hasattr(self, "device_host"):
             self._fit_device_host()
+        if self.jian_jie_moshi and self._card_cols() != self._card_cols_now:
+            self._card_cols_now = 0      # 下一轮 refresh 会按新列数重建
 
     # --------------------------------------------------------------- theme
     def apply_theme(self):
@@ -341,7 +396,27 @@ class MainWindow(QWidget):
         QApplication.instance().quit()
 
     # ------------------------------------------------------------- refresh
+    def _interacting(self) -> bool:
+        """正在拖音量滑块或展开下拉框时，别重排列表。"""
+        for r in self.rows.values():
+            try:
+                if r.slider.isSliderDown() or r.combo.view().isVisible():
+                    return True
+            except Exception:
+                continue
+        return False
+
     def refresh(self, full: bool = False):
+        if self._interacting():
+            return
+        # 卡片模式：窗口宽度变了列数就变，得重建（首轮布局完成后也要校正一次）
+        if self.jian_jie_moshi:
+            cols = self._card_cols()
+            if cols != self._card_cols_now:
+                self._card_cols_now = cols
+                self._drop_card_hosts()
+                self._clear_sessions()
+                self._fav_sig = self._hidden_sig = self._mem_sig = None
         try:
             self.devices = (self.core.output_devices() if self.flow == ac.eRender
                             else self.core.input_devices())
@@ -400,7 +475,9 @@ class MainWindow(QWidget):
         for x in sessions:
             if x.pid and x.pid not in self._first_seen:
                 self._first_seen[x.pid] = now
-        sessions.sort(key=lambda x: -self._first_seen.get(x.pid, 0.0))
+        # 排序：先按进程真实启动时间倒序（后启动的在上面），拿不到再用发现时间兜底
+        sessions.sort(key=lambda x: (-(x.create_ts or 0.0),
+                                     -self._first_seen.get(x.pid, 0.0)))
 
         self._update_section_label()
 
@@ -468,6 +545,23 @@ class MainWindow(QWidget):
             if isinstance(w, DeviceCard):
                 w.set_active(w.device.id == self.selected_device)
 
+    def _on_fenzu_toggled(self, on: bool):
+        self.an_shengka_fenzu = bool(on)
+        self.store.set_setting("an_shengka_fenzu", self.an_shengka_fenzu)
+        self._fav_sig = self._hidden_sig = self._mem_sig = None
+        self.refresh(full=True)
+
+    def _on_compact_toggled(self, on: bool):
+        self.jian_jie_moshi = bool(on)
+        self.store.set_setting("jian_jie_moshi", self.jian_jie_moshi)
+        # 布局变了必须重建：行控件本身不同（卡片 / 列表）
+        self._sel.clear()
+        self._sel_anchor = None
+        self._fav_sig = self._hidden_sig = self._mem_sig = None
+        self._drop_card_hosts()
+        self._clear_sessions()
+        self.refresh(full=True)
+
     def _on_device_clicked(self, device_id: str):
         """点设备卡片：只看这块声卡上的应用，再点一次取消。"""
         self.selected_device = None if self.selected_device == device_id else device_id
@@ -488,15 +582,25 @@ class MainWindow(QWidget):
             self.section_label.setText("正在播放的应用")
 
     def _on_device_menu(self, card, gpos):
-        """声卡卡片右键：设为系统默认。"""
+        """声卡卡片右键：刷新声卡 / 设为系统默认。"""
         dev = card.device
         is_default = (dev.id == self._sys_default_id)
         menu = QMenu(self)
+        act_refresh = menu.addAction("刷新声卡")
+        act_refresh.setData("refresh")
+        menu.addSeparator()
         act = menu.addAction(("✓ 当前系统默认" if is_default else "设为系统默认"))
         act.setData("default")
         act.setEnabled(not is_default)
         picked = menu.exec(gpos)
-        if picked is None or str(picked.data() or "") != "default":
+        if picked is None:
+            return
+        what = str(picked.data() or "")
+        if what == "refresh":
+            self._force_refresh()
+            self._flash_status(f"已重新扫描声卡，当前 {len(self.devices)} 块")
+            return
+        if what != "default":
             return
         new_id = self.core.set_default_and_read(dev.id, self.flow)
         if new_id:
@@ -592,6 +696,7 @@ class MainWindow(QWidget):
 
     def _sync_sessions(self, sessions: list[ac.Session]):
         alive = set()
+        now = time.monotonic()
         for s in sessions:
             key = "sys" if s.is_system else f"{s.pid}:{(s.process_name or '').lower()}"
             alive.add(key)
@@ -619,14 +724,24 @@ class MainWindow(QWidget):
                     ic = file_icon(s.exe_path)
                     if not ic.isNull():
                         row.icon_label.setPixmap(ic.pixmap(32, 32))
+            # 刚出现的应用加一圈描边，过了 xin_chuxian_miao 秒自动去掉
+            row.set_new(now - self._first_seen.get(s.pid, 0.0) < xin_chuxian_miao)
+            # 收藏状态以存储为准（别处批量取消后这里也要跟着变）
+            row.set_favorite(self.store.is_fav(s.process_name, s.exe_path))
 
         # 按 sessions 顺序重排行（新应用插到最上面）
         ordered = [self.rows[k] for k in (f"{x.pid}:{(x.process_name or '').lower()}"
                                           if not x.is_system else "sys" for x in sessions)
                    if k in self.rows]
-        for i, row in enumerate(ordered):
-            self.session_layout.insertWidget(i, row)
-            row.set_no(i + 1)
+        if self.an_shengka_fenzu:
+            self._place_all_grouped(ordered, sessions)
+        elif self.jian_jie_moshi:
+            self._place_all_cards(ordered)
+        else:
+            self._drop_grp_heads()
+            for i, row in enumerate(ordered):
+                self.session_layout.insertWidget(i, row)
+                row.set_no(i + 1)
 
         for key in list(self.rows.keys()):
             if key not in alive:
@@ -659,6 +774,194 @@ class MainWindow(QWidget):
             self._empty_hint.deleteLater()
             del self._empty_hint
             self._empty_text = None
+
+    def _place_all_cards(self, ordered: list):
+        """「全部」页不分组时的卡片摆放：一行 cols 张。"""
+        cols = self._card_cols()
+        card_w = self._card_item_width()
+        used: set[tuple] = set()
+        idx = 0
+        no = 0
+        for ci in range(0, len(ordered), cols):
+            chunk = ordered[ci:ci + cols]
+            hkey = ("", ci)
+            host = self._card_hosts.get(hkey)
+            if host is None:
+                host = QWidget()
+                hl = QHBoxLayout(host)
+                hl.setContentsMargins(0, 0, 0, 0)
+                hl.setSpacing(8)
+                self._card_hosts[hkey] = host
+            else:
+                hl = host.layout()
+            self._fill_card_host(host, chunk, card_w)
+            self.session_layout.insertWidget(idx, host)
+            idx += 1
+            used.add(hkey)
+            for row in chunk:
+                no += 1
+                row.set_no(no)
+        for hkey in list(self._card_hosts):
+            if hkey not in used:
+                host = self._card_hosts.pop(hkey)
+                hl = host.layout()
+                while hl is not None and hl.count():
+                    it = hl.takeAt(0)
+                    w = it.widget()
+                    if w is not None:
+                        w.setParent(None)
+                self.session_layout.removeWidget(host)
+                host.deleteLater()
+
+    def _place_all_grouped(self, ordered: list, sessions: list):
+        """「全部」页按声卡分组摆放。"""
+        rev = {id(r): k for k, r in self.rows.items()}
+        dev_of: dict[str, str] = {}
+        for x in sessions:
+            k = "sys" if x.is_system else f"{x.pid}:{(x.process_name or '').lower()}"
+            dev_of[k] = x.device_id or ""
+        buckets: dict[str, list] = {}
+        for row in ordered:
+            buckets.setdefault(dev_of.get(rev.get(id(row), ""), ""), []).append(row)
+        if self.jian_jie_moshi:
+            self._place_all_grouped_cards(buckets)
+            return
+
+        used: set[str] = set()
+        idx = 0
+        no = 0
+        for dev in sorted(buckets, key=self._dev_order_key):
+            rows = buckets[dev]
+            opened = bool(self._group_open.get(("all", f"dev:{dev}"), True))
+            head = self._grp_heads.get(dev)
+            if head is None:
+                head = ListGroupHeader(self._dev_title(dev), len(rows), opened,
+                                       f"dev:{dev}", self.dark, level=2)
+                head.clicked.connect(lambda g: self._on_group_toggle("all", g))
+                self._grp_heads[dev] = head
+            else:
+                head.set_state(len(rows), opened)
+            self.session_layout.insertWidget(idx, head)
+            idx += 1
+            used.add(dev)
+            if not opened:
+                no += len(rows)
+                for row in rows:          # 折叠：从布局里摘掉，别让它们落到列表末尾
+                    self.session_layout.removeWidget(row)
+                    row.setParent(None)
+                continue
+            for row in rows:
+                no += 1
+                self.session_layout.insertWidget(idx, row)
+                idx += 1
+                row.set_no(no)
+        for dev in list(self._grp_heads):
+            if dev not in used:
+                h = self._grp_heads.pop(dev)
+                self.session_layout.removeWidget(h)
+                h.deleteLater()
+
+    def _place_all_grouped_cards(self, buckets: dict):
+        """卡片 + 分组：每个声卡一列，卡片在该列里竖着往下排。"""
+        card_w = self._card_item_width()
+        cols = self._card_cols()
+        groups = []
+        for dev in sorted(buckets, key=self._dev_order_key):
+            rows = buckets[dev]
+            opened = bool(self._group_open.get(("all", f"dev:{dev}"), True))
+            groups.append((dev, rows, opened))
+
+        used_cols: set[tuple] = set()
+        used_devs: set[str] = set()
+        used_hosts: set[tuple] = set()
+        no = 0
+        idx = 0
+        for ci in range(0, len(groups), cols):
+            chunk = groups[ci:ci + cols]
+            hkey = ("allrow", ci)
+            host = self._card_hosts.get(hkey)
+            if host is None:
+                host = QWidget()
+                hl = QHBoxLayout(host)
+                hl.setContentsMargins(0, 0, 0, 0)
+                hl.setSpacing(8)
+                hl.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+                self._card_hosts[hkey] = host
+            else:
+                hl = host.layout()
+            while hl.count():
+                it = hl.takeAt(0)
+                w = it.widget()
+                if w is not None:
+                    w.setParent(None)
+            for dev, rows, opened in chunk:
+                ckey = ("allcol", dev)
+                col = self._card_hosts.get(ckey)
+                if col is None:
+                    col = QWidget()
+                    vl = QVBoxLayout(col)
+                    vl.setContentsMargins(0, 0, 0, 0)
+                    vl.setSpacing(8)
+                    vl.setAlignment(Qt.AlignTop)
+                    self._card_hosts[ckey] = col
+                else:
+                    vl = col.layout()
+                    while vl.count():
+                        it = vl.takeAt(0)
+                        w = it.widget()
+                        if w is not None:
+                            w.setParent(None)
+                head = self._grp_heads.get(dev)
+                if head is None:
+                    head = ListGroupHeader(self._dev_title(dev), len(rows), opened,
+                                           f"dev:{dev}", self.dark, level=2)
+                    head.clicked.connect(lambda g: self._on_group_toggle("all", g))
+                    self._grp_heads[dev] = head
+                else:
+                    head.set_state(len(rows), opened)
+                vl.addWidget(head)
+                used_devs.add(dev)
+                if opened:
+                    for row in rows:
+                        row.setFixedWidth(card_w)
+                        vl.addWidget(row)
+                        no += 1
+                        row.set_no(no)
+                else:
+                    no += len(rows)
+                vl.addStretch(1)
+                col.setFixedWidth(card_w)
+                hl.addWidget(col, 0, Qt.AlignTop | Qt.AlignLeft)
+                used_cols.add(ckey)
+            hl.addStretch(1)
+            self.session_layout.insertWidget(idx, host)
+            idx += 1
+            used_hosts.add(hkey)
+
+        for dev in list(self._grp_heads):
+            if dev not in used_devs:
+                h = self._grp_heads.pop(dev)
+                h.setParent(None)
+                h.deleteLater()
+        for key in list(self._card_hosts):
+            if key in used_cols or key in used_hosts:
+                continue
+            w = self._card_hosts.pop(key)
+            lay = w.layout()
+            while lay is not None and lay.count():
+                it = lay.takeAt(0)
+                c = it.widget()
+                if c is not None:
+                    c.setParent(None)
+            self.session_layout.removeWidget(w)
+            w.deleteLater()
+
+    def _drop_grp_heads(self):
+        """关掉分组时把「全部」页残留的声卡标题清掉。"""
+        for dev, h in list(self._grp_heads.items()):
+            self.session_layout.removeWidget(h)
+            h.deleteLater()
+        self._grp_heads.clear()
 
     def _create_row(self, key: str, s: ac.Session) -> SessionRow | None:
         try:
@@ -813,11 +1116,12 @@ class MainWindow(QWidget):
         return (dev or "") == self.selected_device
 
     def _add_app_row(self, key: str, session, name: str, path: str,
-                     device_id: str, extra_text: str, no: int):
+                     device_id: str, extra_text: str, no: int, place: bool = True):
         row = SessionRow(session, self.devices, self.dark,
                          favorite=self.store.is_fav(name, path),
                          no=no, extra_text=extra_text,
-                         name=name, path=path, device_id=device_id)
+                         name=name, path=path, device_id=device_id,
+                         card=self.jian_jie_moshi)
         row.key = key
         row.device_changed.connect(self._on_device_changed)
         row.volume_changed.connect(self._on_volume_changed)
@@ -828,12 +1132,78 @@ class MainWindow(QWidget):
         menu_handler = {0: self._on_row_menu, 1: self._on_fav_menu,
                         2: self._on_hidden_menu}.get(self.view_mode, self._on_memory_menu)
         row.menu_requested.connect(menu_handler)
-        self.session_layout.insertWidget(self.session_layout.count() - 1, row)
+        if place:
+            if self.jian_jie_moshi:
+                self._add_to_card_row(row)
+            else:
+                self.session_layout.insertWidget(self.session_layout.count() - 1, row)
         self.rows[key] = row
         if session is not None:
             row.apply_current_device(self._effective_device(session))
             row.update_volume(session.volume, session.muted)
         return row
+
+    def _card_cols(self) -> int:
+        """卡片模式一行放几个：按窗口宽算，最少 2 个。"""
+        vw = max(420, self.session_scroll.viewport().width())
+        return max(2, min(6, int((vw + 8) // 208)))
+
+    def _add_to_card_row(self, row):
+        """把行放进当前卡片行；放满一个就另起一行。"""
+        row.setFixedWidth(self._card_item_width())
+        if self._card_lay is None or self._card_n >= self._card_cols():
+            host = QWidget()
+            hl = QHBoxLayout(host)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setSpacing(8)
+            hl.addStretch(1)
+            self.session_layout.insertWidget(self.session_layout.count() - 1, host)
+            self._card_lay = hl
+            self._card_n = 0
+        self._card_lay.insertWidget(self._card_lay.count() - 1, row)
+        self._card_n += 1
+
+    def _fill_card_host(self, host, chunk, card_w):
+        """把一批行装进卡片行容器：靠左排，剩余空白留在右边。"""
+        hl = host.layout()
+        while hl.count():
+            it = hl.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+        for row in chunk:
+            row.setFixedWidth(card_w)
+            hl.addWidget(row)
+        hl.addStretch(1)
+
+    def _card_item_width(self) -> int:
+        vw = max(420, self.session_scroll.viewport().width())
+        cols = self._card_cols()
+        return int((vw - (cols - 1) * 8) / cols)
+
+    def _insert_head(self, head, index: int | None = None):
+        """插分组标题，同时让卡片行另起一行。"""
+        if index is None:
+            self.session_layout.insertWidget(self.session_layout.count() - 1, head)
+        else:
+            self.session_layout.insertWidget(index, head)
+        self._card_lay = None
+        self._card_n = 0
+
+    def _drop_card_hosts(self):
+        """卡片模式切换/清空时，把外框连同里面的行一起摘掉。"""
+        for key, host in list(self._card_hosts.items()):
+            hl = host.layout()
+            while hl is not None and hl.count():
+                it = hl.takeAt(0)
+                w = it.widget()
+                if w is not None:
+                    w.setParent(None)
+            self.session_layout.removeWidget(host)
+            host.deleteLater()
+        self._card_hosts.clear()
+        self._card_lay = None
+        self._card_n = 0
 
     def _show_empty(self, text: str, tag: str):
         hint = EmptyHint(text)
@@ -1035,6 +1405,10 @@ class MainWindow(QWidget):
         """清空会话列表（切到「已移除」页或切回来时用）。"""
         self._clear_layout(self.session_layout)
         self.session_layout.addStretch(1)
+        self._grp_heads.clear()
+        self._card_hosts.clear()
+        self._card_lay = None
+        self._card_n = 0
         self.rows.clear()
         self._sel.clear()
         self._sel_anchor = None
@@ -1044,7 +1418,8 @@ class MainWindow(QWidget):
 
     def _group_sig(self, page: str) -> tuple:
         return (self._group_open.get((page, "run"), True),
-                self._group_open.get((page, "idle"), True))
+                self._group_open.get((page, "idle"), True),
+                self.an_shengka_fenzu)
 
     def _on_group_toggle(self, page: str, gkey: str):
         k = (page, gkey)
@@ -1053,14 +1428,37 @@ class MainWindow(QWidget):
             self._fav_sig = None
         elif page == "hid":
             self._hidden_sig = None
-        else:
+        elif page == "mem":
             self._mem_sig = None
         self.refresh(full=True)
+
+    def _dev_order_key(self, dev_id: str) -> tuple:
+        """声卡分组顺序：跟卡片一致（已按名称排好），不认识的排最后。"""
+        for i, d in enumerate(self.devices):
+            if d.id == dev_id:
+                return (0, i, "")
+        return (1, 0, dev_id or "")
+
+    def _dev_title(self, dev_id: str) -> str:
+        if not dev_id:
+            return "跟随系统 / 未指定"
+        for d in self.devices:
+            if d.id == dev_id:
+                return d.short_name
+        return "其他声卡"
+
+    def _dev_bucket(self, entries: list[tuple]) -> list[tuple]:
+        """按声卡把 entries 归组，返回 [(dev_id, [entries])]，顺序跟卡片一致。"""
+        buckets: dict[str, list] = {}
+        for e in entries:
+            buckets.setdefault(e[4] or "", []).append(e)
+        return sorted(buckets.items(), key=lambda kv: self._dev_order_key(kv[0]))
 
     def _emit_grouped(self, page: str, entries: list[tuple], extra_text: str,
                       idle_action_text: str = "", idle_action=None) -> int:
         """按「运行中 / 未运行」分组插入行，返回插进去的行数。
 
+        开关点亮时在每个一级分组内再按声卡分一层。
         entries: [(key, session, name, path, device_id, 是否运行中)]
         """
         running = [e for e in entries if e[5]]
@@ -1078,16 +1476,82 @@ class MainWindow(QWidget):
             if action_text and idle_action is not None:
                 keys = tuple(e[0] for e in items)
                 head.action.connect(lambda _g, _k=keys: idle_action(list(_k)))
-            self.session_layout.insertWidget(self.session_layout.count() - 1, head)
+            self._insert_head(head)
             shown += 1
             if not opened:
                 no += len(items)          # 折叠时也占号，展开后序号不变
                 continue
-            for key, sess, name, path, dev, _run in items:
-                no += 1
-                shown += 1
-                self._add_app_row(key, sess, name, path, dev, extra_text, no)
+            if self.an_shengka_fenzu and self.jian_jie_moshi:
+                # 卡片 + 分组：每个声卡一列，卡片竖着排
+                no, extra_shown = self._emit_card_columns(page, gkey, items, extra_text, no)
+                shown += extra_shown
+            elif self.an_shengka_fenzu:
+                for dev, sub in self._dev_bucket(items):
+                    sub_key = f"{gkey}|dev:{dev}"
+                    sub_open = bool(self._group_open.get((page, sub_key), True))
+                    sub_head = ListGroupHeader(self._dev_title(dev), len(sub), sub_open,
+                                               sub_key, self.dark, level=2)
+                    sub_head.clicked.connect(lambda g, p=page: self._on_group_toggle(p, g))
+                    self._insert_head(sub_head)
+                    shown += 1
+                    if not sub_open:
+                        no += len(sub)
+                        continue
+                    for key, sess, name, path, dev_id, _run in sub:
+                        no += 1
+                        shown += 1
+                        self._add_app_row(key, sess, name, path, dev_id, extra_text, no)
+            else:
+                for key, sess, name, path, dev_id, _run in items:
+                    no += 1
+                    shown += 1
+                    self._add_app_row(key, sess, name, path, dev_id, extra_text, no)
         return shown
+
+    def _emit_card_columns(self, page: str, gkey: str, items: list, extra_text: str, no: int):
+        """某个一级分组内，按声卡分列摆放卡片。返回 (新序号, 插入的控件数)。"""
+        card_w = self._card_item_width()
+        cols = self._card_cols()
+        groups = self._dev_bucket(items)
+        shown = 0
+        for ci in range(0, len(groups), cols):
+            chunk = groups[ci:ci + cols]
+            host = QWidget()
+            hl = QHBoxLayout(host)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setSpacing(8)
+            hl.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            for dev, sub in chunk:
+                col = QWidget()
+                vl = QVBoxLayout(col)
+                vl.setContentsMargins(0, 0, 0, 0)
+                vl.setSpacing(8)
+                vl.setAlignment(Qt.AlignTop)
+                sub_key = f"{gkey}|dev:{dev}"
+                sub_open = bool(self._group_open.get((page, sub_key), True))
+                sub_head = ListGroupHeader(self._dev_title(dev), len(sub), sub_open,
+                                           sub_key, self.dark, level=2)
+                sub_head.clicked.connect(lambda g, p=page: self._on_group_toggle(p, g))
+                vl.addWidget(sub_head)
+                if sub_open:
+                    for key, sess, name, path, dev_id, _run in sub:
+                        row = self._add_app_row(key, sess, name, path, dev_id,
+                                                extra_text, no, place=False)
+                        if row is None:
+                            continue
+                        no += 1
+                        row.set_no(no)
+                        row.setFixedWidth(card_w)
+                        vl.addWidget(row)
+                else:
+                    no += len(sub)
+                vl.addStretch(1)
+                col.setFixedWidth(card_w)
+                hl.addWidget(col, 0, Qt.AlignTop | Qt.AlignLeft)
+            hl.addStretch(1)
+            self.session_layout.insertWidget(self.session_layout.count() - 1, host)
+            shown += 1
+        return no, shown
 
     def _show_hidden_rows(self):
         items = self.store.hidden_items()
@@ -1111,7 +1575,8 @@ class MainWindow(QWidget):
             if not self._device_ok(s, dev):
                 continue
             entries.append((key, s, str(info.get("name") or key),
-                            str(info.get("path") or ""), dev, s is not None))
+                            str(info.get("path") or ""),
+                            (s.device_id or dev) if s else dev, s is not None))
         if not entries:
             self._show_empty("这块声卡上没有已移除的应用", "hidden-filter")
             return
@@ -1151,13 +1616,12 @@ class MainWindow(QWidget):
             entries.append((k, s,
                             s.process_name if s else name,
                             s.exe_path if s else path,
-                            "" if s else self._rule_device(k),
+                            (s.device_id or "") if s else self._rule_device(k),
                             s is not None))
         if not entries:
             self._show_empty("这块声卡上没有收藏的应用", "fav-filter")
             return
-        self._emit_grouped("fav", entries, "移出收藏", "取消全部收藏",
-                           lambda keys: self._unfav_keys(keys))
+        self._emit_grouped("fav", entries, "移出收藏")
 
     def _show_memory_rows(self):
         """「记忆」页：记忆里的应用，运行中的带完整控制，未运行的置灰。"""
@@ -1183,7 +1647,8 @@ class MainWindow(QWidget):
             if not self._device_ok(s, dev):
                 continue
             entries.append((key, s, str(r.get("name") or key),
-                            str(r.get("path") or ""), dev, s is not None))
+                            str(r.get("path") or ""),
+                            (s.device_id or dev) if s else dev, s is not None))
         if not entries:
             self._show_empty("这块声卡上没有记忆的应用", "memory-filter")
             return
@@ -1281,6 +1746,30 @@ class MainWindow(QWidget):
         live = {self.store.key(x.process_name, x.exe_path) for x in sessions}
         return sorted(k for k in self.store.favorites() if k not in live)
 
+    def _unfav_all(self):
+        """取消全部收藏（含正在运行的）。"""
+        keys = sorted(self.store.favorites())
+        if not keys:
+            self._flash_status("没有收藏")
+            return
+        self._unfav_keys(keys)
+
+    def _idle_memory_keys(self) -> list[str]:
+        """没在运行的记忆的 key 列表。"""
+        try:
+            sessions = self.core.sessions(self.flow)
+        except Exception:
+            sessions = []
+        live = {self.store.key(x.process_name, x.exe_path) for x in sessions}
+        return sorted(k for k in self.store.all_rules() if k not in live)
+
+    def _remove_all_idle_memory(self):
+        keys = self._idle_memory_keys()
+        if not keys:
+            self._flash_status("没有未运行的记忆")
+            return
+        self._remove_memory_keys(keys)
+
     def _unfav_all_idle(self):
         keys = self._idle_fav_keys()
         if not keys:
@@ -1363,6 +1852,12 @@ class MainWindow(QWidget):
 
     # ------------------------------------------------------------- helpers
     def _update_status(self):
+        if hasattr(self, "btn_unfav"):
+            self.btn_unfav.setVisible(self.view_mode == 1)
+        if hasattr(self, "btn_unfav_idle"):
+            self.btn_unfav_idle.setVisible(self.view_mode == 1)
+        if hasattr(self, "btn_mem_clear"):
+            self.btn_mem_clear.setVisible(self.view_mode == 3)
         n_rules = self.store.count()
         n_fav = self.store.fav_count()
         auto = "开" if self.store.settings.get("auto_apply", True) else "关"

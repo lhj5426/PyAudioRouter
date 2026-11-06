@@ -554,6 +554,7 @@ class Session:
     state: int
     device_id: str = ""          # 这个会话当前挂在哪个渲染设备上
     device_name: str = ""
+    create_ts: float = 0.0       # 进程启动时间（Unix 秒），拿不到为 0
     _ctl: object = field(default=None, repr=False)
     _vol: object = field(default=None, repr=False)
     _meter: object = field(default=None, repr=False)
@@ -1036,7 +1037,7 @@ class AudioCore:
                     session_id=_safe(lambda: ctl2.GetSessionIdentifier(), "") or "",
                     instance_id=inst, volume=volume, muted=muted,
                     is_system=is_sys, state=state,
-                    device_id=dev_id,
+                    device_id=dev_id, create_ts=_process_start_ts(pid),
                     _ctl=ctl2, _vol=vol_obj, _meter=meter_obj,
                 )
         result = list(by_key.values())
@@ -1113,6 +1114,24 @@ def _safe(fn, default=None):
 
 
 _PROC_CACHE: dict[int, tuple[str, str]] = {}
+_START_TS_CACHE: dict[int, float] = {}
+
+
+def _process_start_ts(pid: int) -> float:
+    """进程启动时间（Unix 秒），拿不到返回 0。"""
+    if pid <= 0:
+        return 0.0
+    if pid in _START_TS_CACHE:
+        return _START_TS_CACHE[pid]
+    ts = 0.0
+    try:
+        import psutil
+        ts = float(psutil.Process(pid).create_time())
+    except Exception:
+        ts = 0.0
+    if ts > 0:
+        _START_TS_CACHE[pid] = ts
+    return ts
 
 
 def _process_info(pid: int) -> tuple[str, str]:

@@ -1,6 +1,8 @@
 """ui_widgets.py — 自定义控件（无边框标题栏、设备卡片、会话行）"""
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import QFileInfo, QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter
 from PySide6.QtWidgets import (QComboBox, QFileIconProvider, QFrame, QHBoxLayout,
@@ -40,11 +42,11 @@ class TitleBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("TitleBar")
-        self.setFixedHeight(46)
+        self.setFixedHeight(42)
         self._drag_pos: QPoint | None = None
 
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(16, 8, 10, 4)
+        lay.setContentsMargins(16, 6, 10, 2)
         lay.setSpacing(8)
 
         logo = QLabel()
@@ -304,66 +306,108 @@ class SessionRow(QFrame):
     def __init__(self, session: Session | None = None, devices: list[Device] | None = None,
                  dark: bool = False, favorite: bool = False, no: int = 0,
                  extra_text: str = "", name: str = "", path: str = "",
-                 device_id: str = "", parent=None):
+                 device_id: str = "", compact: bool = False, card: bool = False,
+                 parent=None):
         super().__init__(parent)
         self.setObjectName("SessionRow")
         self.setProperty("sel", "false")
+        self.setProperty("cmp", "card" if card else ("true" if compact else "false"))
         self.session = session
         self.devices = list(devices or [])
         self.key = ""
         self._fav = bool(favorite)
         self._suppress = False
         self._live = session is not None
-        self.setFixedHeight(64)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._compact = bool(compact) or bool(card)
+        self._card = bool(card)
+        if card:
+            self.setFixedHeight(120)
+            self.setMinimumWidth(186)
+        else:
+            self.setFixedHeight(40 if compact else 64)
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         c = theme.palette(dark)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 8, 12, 8)
-        lay.setSpacing(10)
+        if card:
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(10, 8, 10, 8)
+            lay.setSpacing(5)
+        else:
+            lay = QHBoxLayout(self)
+            lay.setContentsMargins(10 if compact else 12, 4 if compact else 8,
+                                   10 if compact else 12, 4 if compact else 8)
+            lay.setSpacing(8 if compact else 10)
 
-        # 序号
+        # ---- 序号 ----
         self.no_label = QLabel(str(no))
         self.no_label.setObjectName("RowNo")
-        self.no_label.setFixedWidth(18)
+        self.no_label.setFixedWidth(16 if card else 18)
         self.no_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        lay.addWidget(self.no_label, 0, Qt.AlignVCenter)
+        if not card:
+            lay.addWidget(self.no_label, 0, Qt.AlignVCenter)
 
-        # 图标
+        # ---- 图标 ----
         exe_path = (session.exe_path if session else path) or ""
+        ic_size = 18 if card else (20 if compact else 32)
         self.icon_label = QLabel()
-        self.icon_label.setFixedSize(32, 32)
+        self.icon_label.setFixedSize(ic_size, ic_size)
         icon = file_icon(exe_path)
         if icon.isNull():
-            self.icon_label.setPixmap(theme.device_pixmap(1, c["faint"], 20))
+            self.icon_label.setPixmap(theme.device_pixmap(1, c["faint"], ic_size))
         else:
-            self.icon_label.setPixmap(icon.pixmap(32, 32))
-        lay.addWidget(self.icon_label, 0, Qt.AlignVCenter)
+            self.icon_label.setPixmap(icon.pixmap(ic_size, ic_size))
+        if not card:
+            lay.addWidget(self.icon_label, 0, Qt.AlignVCenter)
 
-        # 名称 + 路径
+        # ---- 名称 / 路径 / 启动时间 ----
         title = session.title if session else (name or path or "—")
         if session and session.is_system:
             self._full_path = "系统声音（Windows 音频引擎）"
         else:
             self._full_path = exe_path or "路径不可读（权限不足）"
-        col = QVBoxLayout()
-        col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(2)
         self.name_label = QLabel(title)
         self.name_label.setObjectName("AppName")
         self.name_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        col.addWidget(self.name_label)
         self.sub_label = QLabel(self._full_path)
         self.sub_label.setObjectName("AppSub")
         self.sub_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._path_label = self.sub_label
-        col.addWidget(self.sub_label)
-        lay.addLayout(col, 1)
+        self.time_label = QLabel("")
+        self.time_label.setObjectName("AppTime")
+        start_tip = ""
+        if session is not None and session.create_ts > 0:
+            start_tip = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session.create_ts))
+            self.time_label.setText(time.strftime("%m-%d %H:%M", time.localtime(session.create_ts)))
+            self.time_label.setToolTip(f"进程启动时间：{start_tip}")
 
-        # 声卡下拉
+        if not card:
+            col = QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(0 if compact else 2)
+            col.addWidget(self.name_label)
+            sub_row = QHBoxLayout()
+            sub_row.setContentsMargins(0, 0, 0, 0)
+            sub_row.setSpacing(8)
+            sub_row.addWidget(self.sub_label, 1)
+            sub_row.addWidget(self.time_label, 0, Qt.AlignRight | Qt.AlignVCenter)
+            col.addLayout(sub_row)
+            if compact:
+                self.sub_label.setVisible(False)
+                self.time_label.setVisible(False)
+            lay.addLayout(col, 1)
+
+        # ---- 声卡下拉 ----
         self.combo = NoWheelComboBox()
-        self.combo.setMinimumWidth(150)
-        self.combo.setMaximumWidth(220)
+        if card:
+            self.combo.setMinimumHeight(26)
+            self.combo.setMaximumHeight(26)
+        elif compact:
+            self.combo.setMinimumWidth(112)
+            self.combo.setMaximumWidth(150)
+            self.combo.setFixedHeight(26)
+        else:
+            self.combo.setMinimumWidth(150)
+            self.combo.setMaximumWidth(220)
         self.combo.setCursor(Qt.PointingHandCursor)
         self.combo.addItem("跟随系统", "")
         name_count: dict[str, int] = {}
@@ -379,56 +423,74 @@ class SessionRow(QFrame):
             self.combo.addItem(f"（不在线）{device_id[-6:-1]}", device_id)
         self.combo.setCurrentIndex(max(0, self.combo.findData(device_id or "")))
         self.combo.currentIndexChanged.connect(self._on_device_selected)
-        lay.addWidget(self.combo, 0, Qt.AlignVCenter)
+        if not card:
+            lay.addWidget(self.combo, 0, Qt.AlignVCenter)
 
-        # 音量 + 电平
-        vol_col = QVBoxLayout()
-        vol_col.setContentsMargins(0, 0, 0, 0)
-        vol_col.setSpacing(3)
+        # ---- 音量 / 电平 ----
+        bar_w = 74 if compact else 96
+        lv_w = 62 if compact else 96
         self.slider = NoWheelSlider(Qt.Horizontal)
         self.slider.setRange(0, 100)
         self.slider.setValue(int(round((session.volume if session else 1.0) * 100)))
-        self.slider.setFixedWidth(96)
+        if not card:
+            self.slider.setFixedWidth(bar_w)
         self.slider.setCursor(Qt.PointingHandCursor)
         self.slider.valueChanged.connect(self._on_volume)
-        vol_col.addWidget(self.slider)
-        level_row = QHBoxLayout()
-        level_row.setContentsMargins(0, 0, 0, 0)
-        level_row.setSpacing(5)
         self.level_bar = LevelBar(dark)
-        self.level_bar.setFixedWidth(96)
-        level_row.addWidget(self.level_bar)
+        if not card:
+            self.level_bar.setFixedWidth(lv_w)
         self.level_label = QLabel("0%" if session else "—")
         self.level_label.setObjectName("LevelPct")
-        self.level_label.setFixedWidth(34)
+        self.level_label.setFixedWidth(32)
         self.level_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        level_row.addWidget(self.level_label)
-        vol_col.addLayout(level_row)
-        lay.addLayout(vol_col)
 
         vol = session.volume if session else 0.0
         self.vol_label = QLabel(f"{int(round(vol * 100))}%" if session else "—")
         self.vol_label.setObjectName("VolValue")
         self.vol_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        lay.addWidget(self.vol_label, 0, Qt.AlignVCenter)
+        if compact:
+            self.vol_label.setFixedWidth(34)
 
-        # 静音
+        if not card:
+            if compact:
+                vol_row = QHBoxLayout()
+                vol_row.setContentsMargins(0, 0, 0, 0)
+                vol_row.setSpacing(6)
+                vol_row.addWidget(self.slider, 0, Qt.AlignVCenter)
+                vol_row.addWidget(self.level_bar, 0, Qt.AlignVCenter)
+                vol_row.addWidget(self.level_label, 0, Qt.AlignVCenter)
+                lay.addLayout(vol_row)
+            else:
+                vol_col = QVBoxLayout()
+                vol_col.setContentsMargins(0, 0, 0, 0)
+                vol_col.setSpacing(3)
+                vol_col.addWidget(self.slider)
+                level_row = QHBoxLayout()
+                level_row.setContentsMargins(0, 0, 0, 0)
+                level_row.setSpacing(5)
+                level_row.addWidget(self.level_bar)
+                level_row.addWidget(self.level_label)
+                vol_col.addLayout(level_row)
+                lay.addLayout(vol_col)
+            lay.addWidget(self.vol_label, 0, Qt.AlignVCenter)
+
+        # ---- 静音 / 收藏 ----
         self.mute_btn = QPushButton(("🔇" if session and session.muted else "🔊"))
         self.mute_btn.setObjectName("IconBtn")
         self.mute_btn.setCheckable(True)
         self.mute_btn.setChecked(bool(session and session.muted))
         self.mute_btn.setToolTip("静音 / 取消静音")
         self.mute_btn.clicked.connect(self._on_mute)
-        lay.addWidget(self.mute_btn, 0, Qt.AlignVCenter)
+        if not card:
+            lay.addWidget(self.mute_btn, 0, Qt.AlignVCenter)
 
-        # 收藏
         self.fav_btn = QPushButton()
         self.fav_btn.setObjectName("FavBtn")
         self.fav_btn.setCursor(Qt.PointingHandCursor)
         self.fav_btn.setToolTip("收藏 / 取消收藏")
         self.fav_btn.clicked.connect(self._on_fav)
-        lay.addWidget(self.fav_btn, 0, Qt.AlignVCenter)
-        self._sync_fav()
+        if not card:
+            lay.addWidget(self.fav_btn, 0, Qt.AlignVCenter)
 
         # 页签专属动作按钮（取消收藏 / 恢复 / 删除记忆）
         self.action_btn = None
@@ -436,15 +498,48 @@ class SessionRow(QFrame):
             self.action_btn = QPushButton(extra_text)
             self.action_btn.setObjectName("GhostBtn")
             self.action_btn.setCursor(Qt.PointingHandCursor)
+            self.action_btn.setFixedHeight(24)
             self.action_btn.clicked.connect(lambda: self.action.emit(self.key))
-            lay.addWidget(self.action_btn, 0, Qt.AlignVCenter)
+            if not card:
+                lay.addWidget(self.action_btn, 0, Qt.AlignVCenter)
+
+        if card:
+            top = QHBoxLayout()
+            top.setContentsMargins(0, 0, 0, 0)
+            top.setSpacing(6)
+            top.addWidget(self.no_label, 0, Qt.AlignVCenter)
+            top.addWidget(self.icon_label, 0, Qt.AlignVCenter)
+            top.addWidget(self.name_label, 1)
+            top.addWidget(self.mute_btn, 0, Qt.AlignVCenter)
+            top.addWidget(self.fav_btn, 0, Qt.AlignVCenter)
+            lay.addLayout(top)
+            lay.addWidget(self.combo)
+            vrow = QHBoxLayout()
+            vrow.setContentsMargins(0, 0, 0, 0)
+            vrow.setSpacing(6)
+            vrow.addWidget(self.slider, 1)
+            vrow.addWidget(self.vol_label, 0, Qt.AlignVCenter)
+            lay.addLayout(vrow)
+            lrow = QHBoxLayout()
+            lrow.setContentsMargins(0, 0, 0, 0)
+            lrow.setSpacing(5)
+            lrow.addWidget(self.level_bar, 1)
+            lrow.addWidget(self.level_label, 0, Qt.AlignVCenter)
+            if self.action_btn is not None:
+                lrow.addWidget(self.action_btn, 0, Qt.AlignVCenter)
+            lay.addLayout(lrow)
+
+        self._sync_fav()      # 星标初始状态（构造时没同步过就会是空白）
 
         # 没在运行：音量/静音/电平没有意义，置灰
         if not self._live:
             self.slider.setEnabled(False)
             self.mute_btn.setEnabled(False)
 
-        self.setToolTip(f"{title}\n{exe_path or ''}")
+        tip = f"{title}\n{exe_path or ''}"
+        if start_tip:
+            tip += f"\n启动时间：{start_tip}"
+        self.setToolTip(tip)
 
     # -- 交互 ---------------------------------------------------------------
     def resizeEvent(self, e):
@@ -511,6 +606,8 @@ class SessionRow(QFrame):
         self.no_label.setText(str(n))
 
     def set_favorite(self, on: bool):
+        if self._fav == bool(on):
+            return
         self._suppress = True
         try:
             self._fav = bool(on)
@@ -522,6 +619,15 @@ class SessionRow(QFrame):
         val = "true" if on else "false"
         if self.property("sel") != val:
             self.setProperty("sel", val)
+            self.style().unpolish(self)
+            self.style().polish(self)
+            self.update()
+
+    def set_new(self, on: bool):
+        """新出现的应用行：橙色描边，过一会儿自动消失。"""
+        val = "true" if on else "false"
+        if self.property("new") != val:
+            self.setProperty("new", val)
             self.style().unpolish(self)
             self.style().polish(self)
             self.update()
@@ -567,18 +673,21 @@ class ListGroupHeader(QFrame):
     action = Signal(str)           # 右侧按钮点击 (分组 key)
 
     def __init__(self, title: str, count: int, opened: bool, group_key: str,
-                 dark: bool, parent=None, action_text: str = ""):
+                 dark: bool, parent=None, action_text: str = "", level: int = 1):
         super().__init__(parent)
         self.setObjectName("GroupHead")
-        self.setFixedHeight(26)
+        self.setFixedHeight(24 if level > 1 else 26)
         self.setCursor(Qt.PointingHandCursor)
         self.group_key = group_key
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setContentsMargins(20 if level > 1 else 4, 2, 4, 2)
         lay.setSpacing(6)
-        lab = QLabel(f"{'▾' if opened else '▸'} {title} ({count})")
-        lab.setObjectName("GroupTitle")
-        lay.addWidget(lab)
+        self._title = title
+        self._count = count
+        self._opened = opened
+        self._label = QLabel(self._text())
+        self._label.setObjectName("GroupTitle" if level == 1 else "GroupTitle2")
+        lay.addWidget(self._label)
         lay.addStretch(1)
         if action_text:
             btn = QPushButton(action_text)
@@ -587,6 +696,17 @@ class ListGroupHeader(QFrame):
             btn.setFixedHeight(22)
             btn.clicked.connect(lambda: self.action.emit(self.group_key))
             lay.addWidget(btn)
+
+    def _text(self) -> str:
+        return f"{'▾' if self._opened else '▸'} {self._title} ({self._count})"
+
+    def set_state(self, count: int, opened: bool):
+        """复用标题时更新数量与展开箭头，避免每轮刷新重建控件。"""
+        if count == self._count and opened == self._opened:
+            return
+        self._count = count
+        self._opened = opened
+        self._label.setText(self._text())
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:

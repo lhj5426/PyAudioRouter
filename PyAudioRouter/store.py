@@ -78,6 +78,8 @@ class Store:
             "show_system_sounds": False,
             "win": [],
             "hidden": {},          # 已移除的应用：key -> {name, path}
+            "an_shengka_fenzu": False,   # 「按声卡分组」按钮是否点亮
+            "jian_jie_moshi": False,     # 「精简模式」按钮是否点亮
         }
         self.load()
 
