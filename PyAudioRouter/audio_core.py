@@ -1097,13 +1097,12 @@ class AudioCore:
 
 
 def _mingcheng_paixu(name: str):
-    """按名称自然排序的键：00键盘 < 11黑色 < 22白色 < 333 < 4444。"""
-    key = []
-    for part in re.split(r"(\d+)", (name or "").lower()):
-        if not part:
-            continue
-        key.append((0, int(part), "") if part.isdigit() else (1, 0, part))
-    return key
+    """按名称逐字比较排序：00键盘 < 11黑色 < 22白色 < 333 < 44电视。
+
+    注意是「按字符比」不是「按数字大小比」——名字开头的数字只要按你想要的
+    顺序写就行，写成 44 不会因为数值比 333 小而被插到 333 前面。
+    """
+    return (name or "").strip().lower()
 
 
 def _safe(fn, default=None):
