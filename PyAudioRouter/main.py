@@ -684,6 +684,12 @@ class MainWindow(QWidget):
             if isinstance(w, DeviceCard):
                 w.set_app_count(counts.get(w.device.id, 0))
 
+    def showEvent(self, e):
+        super().showEvent(e)
+        # 窗口第一次显示时布局还没算完，viewport 宽度是旧值；等这一轮事件处理完
+        # 再排一次，声卡卡片才会一次铺满整行，不用手动拖窗口
+        QTimer.singleShot(0, self._fit_device_host)
+
     def _fit_device_host(self):
         """设备卡片宽度有下限（166px），设备变多时靠横向滚动，不压缩已有卡片。"""
         n = max(1, len(self.devices))
